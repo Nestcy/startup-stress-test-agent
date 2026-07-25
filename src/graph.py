@@ -12,17 +12,33 @@ from src.nodes.human_review_node import (
 from src.nodes.report_node import generate_final_report
 from src.utils.logger import logger
 
-# Feedback strings that a founder can enter at a checkpoint to end the
-# evaluation there instead of continuing to the next gate. Kept as a small
-# set of plain words rather than an LLM judgment call, since the point of
-# this routing is to hand the "should we stop?" decision to the human, not
-# have the model re-decide it.
-_STOP_WORDS = {"stop", "exit", "no", "end", "quit"}
-
+# Feedback that should end the evaluation at the current checkpoint instead
+# of continuing to the next gate. Matched against the start of the founder's
+# feedback (not the whole string), so phrases like "no thanks" or "stop here,
+# I want to think about this" still count as a stop -- but feedback that just
+# happens to contain a critique starting with something else, e.g. "the
+# competitive landscape looks weak", doesn't accidentally match.
+_STOP_PHRASES = (
+    "stop",
+    "exit",
+    "no thanks",
+    "no thank you",
+    "not now",
+    "end here",
+    "quit",
+    "cancel",
+)
 
 def _human_requested_stop(feedback: str) -> bool:
-    """True only if the founder's feedback is explicitly a stop signal."""
-    return (feedback or "").strip().lower() in _STOP_WORDS
+    """True if the founder's feedback signals they want to stop here.
+
+    Uses a starts-with check rather than an exact match, since real
+    feedback is rarely a single bare word -- "no thanks, I want to rethink
+    this" should count, but "no clear market" (a critique, not a stop
+    request) shouldn't.
+    """
+    normalized = (feedback or "").strip().lower()
+    return any(normalized.startswith(phrase) for phrase in _STOP_PHRASES)
 
 
 def build_graph(checkpointer=None, interrupt_before=None):
