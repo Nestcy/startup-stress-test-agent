@@ -18,13 +18,13 @@ class StartupStressTestState(TypedDict):
     # Input
     startup_idea: str
     idea_description: str
-    
+
     # Desirability Gate
     desirability_analysis: Optional[str]
     desirability_status: EvaluationStatus
     desirability_score: Optional[float]
     desirability_human_feedback: Optional[str]
-    
+
     # Viability Gate
     viability_analysis: Optional[str]
     viability_status: EvaluationStatus
@@ -32,18 +32,28 @@ class StartupStressTestState(TypedDict):
     viability_human_feedback: Optional[str]
     funding_model: Optional[str]  # "bootstrap" or "vc"; defaults to "bootstrap" if not set
     arr_target: Optional[str]     # e.g. "100k", "1m", "10m", or a raw number as a string; defaults to "1m"
-    
+
     # Feasibility Gate
     feasibility_analysis: Optional[str]
     feasibility_status: EvaluationStatus
     feasibility_score: Optional[float]
     feasibility_human_feedback: Optional[str]
-    
+
     # Final Report
     final_report: Optional[str]
     overall_score: Optional[float]
     recommendation: Optional[str]
-    
+
+    # Revision flow: set when a /revise on an earlier stage leaves later
+    # stages holding results from a prior pass. `_confirm_source` records
+    # which stage triggered the confirm_downstream checkpoint, so its
+    # routing function knows whether "reevaluate" means go to viability
+    # (came from a desirability revise) or feasibility (came from a
+    # viability revise). `downstream_choice` holds the founder's answer:
+    # "reevaluate" or "keep".
+    _confirm_source: Optional[str]
+    downstream_choice: Optional[str]
+
     # Metadata
     search_results: Optional[List[dict]]
     conversation_history: List[dict]
@@ -85,7 +95,9 @@ def create_initial_state(
         "final_report": None,
         "overall_score": None,
         "recommendation": None,
+        "_confirm_source": None,
+        "downstream_choice": None,
         "search_results": None,
         "conversation_history": [],
-        "errors": []
+        "errors": [],
     }
