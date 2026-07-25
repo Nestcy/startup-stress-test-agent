@@ -13,7 +13,7 @@ class Config:
     DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Postgres addon sets this automatically
  
      # Validation
-     if not GROQ_API_KEY:
+    if not GROQ_API_KEY:
          raise ValueError("GROQ_API_KEY not set in environment variables")
-     if not TAVILY_API_KEY:
+    if not TAVILY_API_KEY:
          raise ValueError("TAVILY_API_KEY not set in environment variables")
