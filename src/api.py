@@ -16,18 +16,11 @@ The `graph` and `checkpointer` below are created once at module import time
 (not per-request) precisely so that state persists *across* requests within
 this running process.
 
-Caveat: `InMemorySaver` keeps every paused run's state in this process's RAM.
-That's fine for local dev and single-instance deployments, but:
-  - a server restart or redeploy loses every in-flight (not yet completed)
-    evaluation.
-  - it will NOT work correctly if you run more than one instance/worker
-    behind a load balancer, since a `/feedback` request could land on a
-    process that never saw the `/start` request for that thread_id.
-For a Railway deployment in particular, keep this to a single instance
-(one worker, no autoscaling) unless you swap `InMemorySaver` for a
-persistent checkpointer (e.g. `langgraph-checkpoint-postgres` pointed at a
-Railway Postgres addon) -- `build_graph()` accepts any checkpointer, so
-that's a one-line change here, not a redesign.
+Persistence: if `DATABASE_URL` is set (Railway's Postgres addon sets this
+automatically once attached), state is stored in Postgres, so it survives
+restarts/redeploys and works with more than one worker. If unset, this falls
+back to `InMemorySaver` for local dev only -- state is lost on restart, and
+it's only safe with a single worker.
 """
 import os
 import uuid
@@ -36,7 +29,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from langgraph.checkpoint.postgress import PostgresSaver
+from langgraph.graph import START
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from src.graph import build_graph
@@ -45,14 +38,20 @@ from src.utils.logger import logger
 from src.utils.config import Config
 
 # --- Graph + checkpointer: created once, reused across all requests ---
+# `EvaluationStatus` (in src/state.py) is a custom Enum stored in state, so it
+# gets written into every checkpoint. Registering it here avoids relying on
+# langgraph's permissive-but-deprecated default for unregistered types --
+# recent langgraph versions warn that unregistered types will eventually be
+# rejected outright, which would break every checkpoint read/write.
 _serde = JsonPlusSerializer(allowed_msgpack_modules=[("src.state", "EvaluationStatus")])
+
 if Config.DATABASE_URL:
-    # Persistent, works across restarts/redeploys and multiple workers.
+    from langgraph.checkpoint.postgres import PostgresSaver
     _pg_cm = PostgresSaver.from_conn_string(Config.DATABASE_URL, serde=_serde)
-    checkpointer = _pg_cm.__enter__()  # keep the connection open for app lifetime
+    checkpointer = _pg_cm.__enter__()  # keep the connection open for the app's lifetime
     checkpointer.setup()  # creates checkpoint tables if they don't exist yet; safe to call every boot
+    logger.info("Using PostgresSaver for checkpoint storage.")
 else:
-    # Local dev fallback only -- state is lost on restart, single worker only.
     from langgraph.checkpoint.memory import InMemorySaver
     logger.warning("DATABASE_URL not set -- using InMemorySaver. State will NOT survive a restart.")
     checkpointer = InMemorySaver(serde=_serde)
@@ -63,6 +62,7 @@ graph = build_graph(
         "human_review_desirability",
         "human_review_viability",
         "human_review_feasibility",
+        "confirm_downstream",
     ],
 )
 
@@ -71,6 +71,7 @@ NODE_TO_STAGE = {
     "human_review_desirability": "desirability",
     "human_review_viability": "viability",
     "human_review_feasibility": "feasibility",
+    "confirm_downstream": "confirm_downstream",
 }
 
 # Which state fields hold the analysis/score to show the reviewer at each stage
@@ -85,6 +86,43 @@ STAGE_FEEDBACK_FIELDS = {
     "desirability": "desirability_human_feedback",
     "viability": "viability_human_feedback",
     "feasibility": "feasibility_human_feedback",
+}
+
+# Which node to "pretend just finished" (via update_state(..., as_node=X))
+# so that invoke(None, config) re-runs the target stage next. Desirability
+# is the entry point, so rewinding to it means pretending we're at START.
+REWIND_ANCHOR = {
+    "desirability": START,
+    "viability": "human_review_desirability",
+    "feasibility": "human_review_viability",
+}
+
+# Fields to clear on the stage being revised. Downstream stages are
+# deliberately left intact -- confirm_downstream asks the founder whether to
+# redo them, rather than the revise endpoint silently wiping or silently
+# keeping stale data.
+STAGE_FIELDS_TO_CLEAR = {
+    "desirability": [
+        "desirability_analysis", "desirability_score", "desirability_human_feedback",
+        "final_report", "overall_score", "recommendation", "downstream_choice",
+    ],
+    "viability": [
+        "viability_analysis", "viability_score", "viability_human_feedback",
+        "final_report", "overall_score", "recommendation", "downstream_choice",
+    ],
+    "feasibility": [
+        "feasibility_analysis", "feasibility_score", "feasibility_human_feedback",
+        "final_report", "overall_score", "recommendation",
+    ],
+}
+
+# Which prior-stage fields must already be populated before a given stage
+# can be revised -- you can't revise viability on a thread that never
+# completed desirability, since there'd be nothing to rewind to.
+STAGE_PREREQUISITES = {
+    "desirability": [],
+    "viability": ["desirability_score"],
+    "feasibility": ["desirability_score", "viability_score"],
 }
 
 
@@ -124,16 +162,28 @@ class FeedbackRequest(BaseModel):
     feedback: str = Field(default="", description="Reviewer's free-text feedback for the current stage")
 
 
+class ReviseRequest(BaseModel):
+    stage: str = Field(..., description="'desirability', 'viability', or 'feasibility'")
+    idea_description: Optional[str] = Field(
+        default=None, description="Updated idea description, if the founder is changing it"
+    )
+
+
+class ConfirmDownstreamRequest(BaseModel):
+    reevaluate: bool = Field(..., description="True to re-run downstream stages, False to keep existing scores")
+
+
 class EvaluationResponse(BaseModel):
     thread_id: str
     startup_idea: str
     status: str  # "awaiting_review" | "completed"
-    stage: str   # "desirability" | "viability" | "feasibility" | "completed"
+    stage: str   # "desirability" | "viability" | "feasibility" | "confirm_downstream" | "completed"
     score: Optional[float] = None
     analysis: Optional[str] = None
     overall_score: Optional[float] = None
     final_report: Optional[str] = None
     recommendation: Optional[str] = None
+    message: Optional[str] = None  # copy for the frontend to display as-is; only set for stages with no score/analysis
 
 
 # --- Helpers ---
@@ -160,6 +210,22 @@ def _response_from_snapshot(thread_id: str, snapshot) -> EvaluationResponse:
     if snapshot.next:
         current_node = snapshot.next[0]
         stage = NODE_TO_STAGE.get(current_node, current_node)
+
+        if stage == "confirm_downstream":
+            source = values.get("_confirm_source", "an earlier stage")
+            next_label = "viability and feasibility" if source == "desirability" else "feasibility"
+            return EvaluationResponse(
+                thread_id=thread_id,
+                startup_idea=startup_idea,
+                status="awaiting_review",
+                stage="confirm_downstream",
+                message=(
+                    f"You revised {source}. {next_label.capitalize()} still "
+                    f"{'has' if next_label == 'feasibility' else 'have'} results from before — "
+                    f"re-evaluate {next_label} too, or keep the existing scores?"
+                ),
+            )
+
         analysis_field, score_field = STAGE_ANALYSIS_FIELDS.get(stage, (None, None))
         return EvaluationResponse(
             thread_id=thread_id,
@@ -229,8 +295,7 @@ def submit_feedback(thread_id: str, payload: FeedbackRequest):
 
     current_node = snapshot.next[0]
     stage = NODE_TO_STAGE.get(current_node)
-    if stage is None:
-        # Defensive: only happens if the graph is paused at a node we didn't expect.
+    if stage is None or stage not in STAGE_FEEDBACK_FIELDS:
         raise HTTPException(status_code=409, detail=f"Evaluation is paused at an unexpected node '{current_node}'")
 
     feedback_field = STAGE_FEEDBACK_FIELDS[stage]
@@ -242,6 +307,77 @@ def submit_feedback(thread_id: str, payload: FeedbackRequest):
     except Exception as e:
         logger.error(f"[{thread_id}] Error resuming evaluation: {e}")
         raise HTTPException(status_code=500, detail=f"Error resuming evaluation: {e}")
+
+    snapshot = graph.get_state(config)
+    return _response_from_snapshot(thread_id, snapshot)
+
+
+@app.post("/evaluate/{thread_id}/confirm-downstream", response_model=EvaluationResponse)
+def confirm_downstream_choice(thread_id: str, payload: ConfirmDownstreamRequest):
+    """Answer the 'do you want to re-evaluate viability/feasibility too?'
+    checkpoint that appears after revising an earlier stage while later
+    stages still hold results from a prior run.
+    """
+    config, snapshot = _get_snapshot_or_404(thread_id)
+
+    if not snapshot.next or snapshot.next[0] != "confirm_downstream":
+        raise HTTPException(status_code=400, detail="No pending downstream confirmation for this evaluation.")
+
+    choice = "reevaluate" if payload.reevaluate else "keep"
+    graph.update_state(config, {"downstream_choice": choice})
+
+    logger.info(f"[{thread_id}] Downstream choice recorded: {choice}, resuming...")
+    try:
+        graph.invoke(None, config=config)
+    except Exception as e:
+        logger.error(f"[{thread_id}] Error resuming after downstream confirmation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    snapshot = graph.get_state(config)
+    return _response_from_snapshot(thread_id, snapshot)
+
+
+@app.post("/evaluate/{thread_id}/revise", response_model=EvaluationResponse)
+def revise_evaluation(thread_id: str, payload: ReviseRequest):
+    """Rewind a completed evaluation back to a given stage and re-run from
+    there, keeping the same thread_id so earlier/later stages' analysis and
+    scores aren't lost. If later stages still hold results from before, the
+    graph pauses at confirm_downstream to ask whether to redo those too.
+    """
+    config, snapshot = _get_snapshot_or_404(thread_id)
+
+    if payload.stage not in REWIND_ANCHOR:
+        raise HTTPException(status_code=400, detail=f"Unknown stage '{payload.stage}'")
+
+    if snapshot.next:
+        raise HTTPException(
+            status_code=400,
+            detail="Evaluation is still in progress; revising only applies once it has a result "
+                   "for the target stage. Submit feedback to advance it, or wait for completion.",
+        )
+
+    missing = [f for f in STAGE_PREREQUISITES[payload.stage] if snapshot.values.get(f) is None]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot revise '{payload.stage}': a prior required stage never completed. "
+                    f"Missing: {missing}",
+        )
+
+    values_to_clear = {field: None for field in STAGE_FIELDS_TO_CLEAR[payload.stage]}
+    if payload.idea_description:
+        values_to_clear["idea_description"] = payload.idea_description
+
+    anchor = REWIND_ANCHOR[payload.stage]
+    logger.info(f"[{thread_id}] Revising from '{payload.stage}', rewinding to anchor '{anchor}'")
+
+    graph.update_state(config, values_to_clear, as_node=anchor)
+
+    try:
+        graph.invoke(None, config=config)
+    except Exception as e:
+        logger.error(f"[{thread_id}] Error during revision: {e}")
+        raise HTTPException(status_code=500, detail=f"Error during revision: {e}")
 
     snapshot = graph.get_state(config)
     return _response_from_snapshot(thread_id, snapshot)
