@@ -29,6 +29,8 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from langchain_groq import Chatgroq
+from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import START
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
@@ -185,6 +187,46 @@ class EvaluationResponse(BaseModel):
     recommendation: Optional[str] = None
     message: Optional[str] = None  # copy for the frontend to display as-is; only set for stages with no score/analysis
 
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, description="Founder's follow-up question about the completed evaluation")
+
+
+class AskResponse(BaseModel):
+    thread_id: str
+    question: str
+    answer: str
+
+
+_ASK_PROMPT = ChatPromptTemplate.from_template("""
+You are answering a founder's follow-up question about a startup evaluation
+that has already been completed. Use only the information below -- don't
+invent scores, facts, or analysis that isn't here. If the question asks
+about something the evaluation didn't cover, say so plainly rather than
+guessing.
+
+Startup Idea: {startup_idea}
+Idea Description: {idea_description}
+
+Desirability ({desirability_score}/100):
+{desirability_analysis}
+
+Viability ({viability_score}/100):
+{viability_analysis}
+
+Feasibility ({feasibility_score}/100):
+{feasibility_analysis}
+
+Overall Score: {overall_score}/100
+Recommendation: {recommendation}
+
+Final Report:
+{final_report}
+
+Founder's question: {question}
+
+Answer directly and concretely. Keep it focused -- a few sentences to a
+short paragraph, not a restatement of the whole report.
+""")
 
 # --- Helpers ---
 
@@ -253,6 +295,50 @@ def _response_from_snapshot(thread_id: str, snapshot) -> EvaluationResponse:
 def health():
     """Simple liveness check for Railway (or any host) to poll."""
     return {"status": "ok"}
+
+@app.post("/evaluate/{thread_id}/ask", response_model=AskResponse)
+def ask_followup(thread_id: str, payload: AskRequest):
+    """Answer a founder's follow-up question about a completed evaluation.
+
+    Stateless with respect to the graph -- this doesn't touch the LangGraph
+    checkpoint at all, it just reads the finished state as context for a
+    direct LLM call. Only works once the evaluation has actually completed,
+    since there's no meaningful "final report" to ask about before then.
+    """
+    _, snapshot = _get_snapshot_or_404(thread_id)
+
+    if snapshot.next:
+        raise HTTPException(
+            status_code=400,
+            detail="This evaluation is still in progress. Follow-up questions are only "
+                   "available once it has completed.",
+        )
+
+    values = snapshot.values
+    llm = ChatGroq(api_key=Config.GROQ_API_KEY, model=Config.GROQ_MODEL, temperature=0.5)
+    chain = _ASK_PROMPT | llm
+
+    logger.info(f"[{thread_id}] Follow-up question: {payload.question}")
+    try:
+        response = chain.invoke({
+            "startup_idea": values.get("startup_idea", ""),
+            "idea_description": values.get("idea_description", ""),
+            "desirability_score": values.get("desirability_score", 0),
+            "desirability_analysis": values.get("desirability_analysis") or "Not available",
+            "viability_score": values.get("viability_score", 0),
+            "viability_analysis": values.get("viability_analysis") or "Not available",
+            "feasibility_score": values.get("feasibility_score", 0),
+            "feasibility_analysis": values.get("feasibility_analysis") or "Not available",
+            "overall_score": values.get("overall_score", 0),
+            "recommendation": values.get("recommendation", ""),
+            "final_report": values.get("final_report", ""),
+            "question": payload.question,
+        })
+    except Exception as e:
+        logger.error(f"[{thread_id}] Error answering follow-up: {e}")
+        raise HTTPException(status_code=500, detail=f"Error answering follow-up: {e}")
+
+    return AskResponse(thread_id=thread_id, question=payload.question, answer=response.content)
 
 
 @app.post("/evaluate/start", response_model=EvaluationResponse)
