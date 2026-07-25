@@ -29,7 +29,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from langchain_groq import Chatgroq
+from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import START
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
