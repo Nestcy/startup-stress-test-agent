@@ -36,21 +36,27 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgress import PostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from src.graph import build_graph
 from src.state import create_initial_state
 from src.utils.logger import logger
+from src.utils.config import Config
 
 # --- Graph + checkpointer: created once, reused across all requests ---
-# `EvaluationStatus` (in src/state.py) is a custom Enum stored in state, so it
-# gets written into every checkpoint. Registering it here avoids relying on
-# langgraph's permissive-but-deprecated default for unregistered types --
-# recent langgraph versions warn that unregistered types will eventually be
-# rejected outright, which would break every checkpoint read/write.
 _serde = JsonPlusSerializer(allowed_msgpack_modules=[("src.state", "EvaluationStatus")])
-checkpointer = InMemorySaver(serde=_serde)
+if Config.DATABASE_URL:
+    # Persistent, works across restarts/redeploys and multiple workers.
+    _pg_cm = PostgresSaver.from_conn_string(Config.DATABASE_URL, serde=_serde)
+    checkpointer = _pg_cm.__enter__()  # keep the connection open for app lifetime
+    checkpointer.setup()  # creates checkpoint tables if they don't exist yet; safe to call every boot
+else:
+    # Local dev fallback only -- state is lost on restart, single worker only.
+    from langgraph.checkpoint.memory import InMemorySaver
+    logger.warning("DATABASE_URL not set -- using InMemorySaver. State will NOT survive a restart.")
+    checkpointer = InMemorySaver(serde=_serde)
+
 graph = build_graph(
     checkpointer=checkpointer,
     interrupt_before=[
