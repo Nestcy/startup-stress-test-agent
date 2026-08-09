@@ -1,14 +1,11 @@
-"""Human review checkpoint nodes.
+"""Human review and interrupt-point nodes.
 
-These nodes no longer block on input(). Each one runs *after* the graph has
-already been resumed from an `interrupt_before` pause -- by that point,
-whoever resumed the run (the CLI loop or an API request handler) has written
-the reviewer's feedback into state via `graph.update_state(...)`. All a node
-does now is fill in a default if no feedback was given and mark the gate
-approved. The graph's conditional edges then decide where to go next based
-on that feedback (see graph.py) -- not based on scores, since scores on an
-early-stage, unvalidated idea reflect confidence in a guess, not a verdict
-on the idea.
+These nodes largely don't block on input() themselves. Each one runs
+*after* the graph has already been resumed from an `interrupt_before` pause
+-- by that point, whoever resumed the run (the CLI loop or an API request
+handler) has written the founder's response into state via
+`graph.update_state(...)`. The graph's conditional edges (see graph.py)
+then decide where to go next based on that response.
 """
 from src.state import StartupStressTestState, EvaluationStatus
 from src.utils.logger import logger
@@ -57,5 +54,18 @@ def confirm_downstream(state: StartupStressTestState) -> StartupStressTestState:
     somewhere to pause and wait for `downstream_choice` to be written into
     state (via POST /evaluate/{thread_id}/confirm-downstream) before
     continuing.
+    """
+    return state
+
+
+def await_intake_response(state: StartupStressTestState) -> StartupStressTestState:
+    """No-op node used purely as an interrupt point.
+
+    The graph pauses here right after intake_node asks a question (see
+    src/nodes/intake_node.py), waiting for the founder's answer to be
+    written into state -- via POST /evaluate/{thread_id}/respond, or the
+    CLI's input() loop -- before resuming and routing back to intake_node
+    for another question, or on to that stage's analysis node once
+    intake_node has set intake_ready = True.
     """
     return state

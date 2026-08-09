@@ -9,10 +9,12 @@ from src.graph import build_graph
 from src.state import create_initial_state
 from src.utils.logger import logger
 
-HUMAN_REVIEW_NODES = [
+ALL_INTERRUPT_NODES = [
+    "await_intake_response",
     "human_review_desirability",
     "human_review_viability",
     "human_review_feasibility",
+    "confirm_downstream",
 ]
 
 # Maps the node the graph is paused before -> which state fields to show/fill
@@ -23,23 +25,49 @@ STAGE_INFO = {
 }
 
 
-def review_checkpoint(node_name: str, values: dict) -> str:
-    """Print the analysis for the current stage and collect feedback via input().
-
-    This is exactly the interaction that used to live inside
-    src/nodes/human_review_node.py. It moved here because a node function
-    shouldn't assume it's being run interactively -- the API resumes the same
-    graph from an HTTP request instead. The CLI is just one of possibly many
-    callers that can supply feedback and resume the run.
+def handle_intake_checkpoint(values: dict) -> dict:
+    """Print the agent's latest intake question and collect the founder's
+    reply. Returns the state update to write back before resuming.
     """
-    stage_name, analysis_field, score_field, _ = STAGE_INFO[node_name]
+    stage = values.get("_intake_stage", "desirability")
+    key = f"_intake_history_{stage}"
+    history = values.get(key) or []
+    last_message = history[-1]["content"] if history else "Tell me a bit more about your idea."
+
+    print("\n" + "-"*80)
+    print(f"[{stage} intake]")
+    print(last_message)
+    print("-"*80)
+    answer = input("You: ").strip()
+
+    conv_history = values.get("conversation_history") or []
+    return {
+        key: history + [{"role": "human", "content": answer}],
+        "conversation_history": conv_history + [{"role": "human", "content": answer}],
+    }
+
+
+def handle_review_checkpoint(node_name: str, values: dict) -> dict:
+    """Print the analysis for the current stage and collect feedback via input()."""
+    stage_name, analysis_field, score_field, feedback_field = STAGE_INFO[node_name]
     print("\n" + "="*80)
     print(f"{stage_name.upper()} ANALYSIS COMPLETE")
     print("="*80)
     print(f"Score: {values.get(score_field)}/100")
     print(f"\nAnalysis:\n{values.get(analysis_field)}")
     print("="*80)
-    return input(f"\nProvide your feedback on {stage_name} (or press Enter to continue): ").strip()
+    feedback = input(f"\nProvide your feedback on {stage_name} (or press Enter to continue): ").strip()
+    return {feedback_field: feedback or "Approved to proceed"}
+
+
+def handle_confirm_downstream_checkpoint(values: dict) -> dict:
+    """Ask whether to re-evaluate downstream stages after a revise."""
+    source = values.get("_confirm_source", "an earlier stage")
+    next_label = "viability and feasibility" if source == "desirability" else "feasibility"
+    print("\n" + "-"*80)
+    print(f"You revised {source}. {next_label.capitalize()} still have results from before.")
+    answer = input(f"Re-evaluate {next_label} too? (y/N): ").strip().lower()
+    return {"downstream_choice": "reevaluate" if answer == "y" else "keep"}
 
 
 def main():
@@ -69,22 +97,34 @@ def main():
         logger.info("Building graph...")
         serde = JsonPlusSerializer(allowed_msgpack_modules=[("src.state", "EvaluationStatus")])
         checkpointer = InMemorySaver(serde=serde)
-        graph = build_graph(checkpointer=checkpointer, interrupt_before=HUMAN_REVIEW_NODES)
+        graph = build_graph(checkpointer=checkpointer, interrupt_before=ALL_INTERRUPT_NODES)
 
         logger.info(f"Starting evaluation for: {startup_idea}")
         print(f"\nStarting evaluation for: {startup_idea}")
         print(f"Description: {idea_description}\n")
+        print("The agent will ask a few quick questions before each stage. Let's start:\n")
 
         graph.invoke(initial_state, config=config)
         snapshot = graph.get_state(config)
 
-        # Walk through checkpoints, feeding feedback back in and resuming,
-        # until the graph has nothing left to run (snapshot.next is empty).
+        # Walk through every kind of checkpoint -- intake questions, stage
+        # reviews, and downstream-confirmation prompts -- feeding the
+        # founder's response back in and resuming, until the graph has
+        # nothing left to run (snapshot.next is empty).
         while snapshot.next:
             node_name = snapshot.next[0]
-            _, _, _, feedback_field = STAGE_INFO[node_name]
-            feedback = review_checkpoint(node_name, snapshot.values)
-            graph.update_state(config, {feedback_field: feedback or "Approved to proceed"})
+
+            if node_name == "await_intake_response":
+                update = handle_intake_checkpoint(snapshot.values)
+            elif node_name == "confirm_downstream":
+                update = handle_confirm_downstream_checkpoint(snapshot.values)
+            elif node_name in STAGE_INFO:
+                update = handle_review_checkpoint(node_name, snapshot.values)
+            else:
+                logger.warning(f"Unhandled checkpoint node '{node_name}', approving with no feedback.")
+                update = {}
+
+            graph.update_state(config, update)
             graph.invoke(None, config=config)
             snapshot = graph.get_state(config)
 
