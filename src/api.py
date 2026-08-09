@@ -237,7 +237,7 @@ def _response_from_snapshot(thread_id: str, snapshot) -> EvaluationResponse:
 
         if stage == "intake":
             intake_stage = values.get("_intake_stage", "desirability")
-            history = values.get(f"_intake_history_{intake_stage}") or []
+            history = (values.get("intake_history") or {}).get(intake_stage) or []
             last_message = history[-1]["content"] if history else "Let's get started."
             return EvaluationResponse(
                 thread_id=thread_id,
@@ -332,12 +332,13 @@ def respond_to_intake(thread_id: str, payload: RespondRequest):
         raise HTTPException(status_code=400, detail="No pending intake question for this evaluation.")
 
     stage = snapshot.values.get("_intake_stage", "desirability")
-    key = f"_intake_history_{stage}"
-    history = snapshot.values.get(key) or []
+    intake_history = snapshot.values.get("intake_history") or {}
+    history = intake_history.get(stage) or []
     conv_history = snapshot.values.get("conversation_history") or []
 
+    intake_history[stage] = history + [{"role": "human", "content": payload.answer}]
     graph.update_state(config, {
-        key: history + [{"role": "human", "content": payload.answer}],
+        "intake_history": intake_history,
         "conversation_history": conv_history + [{"role": "human", "content": payload.answer}],
     })
 
@@ -495,7 +496,9 @@ def revise_evaluation(thread_id: str, payload: ReviseRequest):
     values_to_clear = {field: None for field in STAGE_FIELDS_TO_CLEAR[payload.stage]}
     values_to_clear["_intake_stage"] = payload.stage
     values_to_clear["intake_ready"] = False
-    values_to_clear[f"_intake_history_{payload.stage}"] = []
+    existing_intake_history = snapshot.values.get("intake_history") or {}
+    existing_intake_history[payload.stage] = []
+    values_to_clear["intake_history"] = existing_intake_history
     if payload.idea_description:
         values_to_clear["idea_description"] = payload.idea_description
 

@@ -78,17 +78,19 @@ def intake_node(state: StartupStressTestState) -> StartupStressTestState:
     stage = state.get("_intake_stage", "desirability")
     llm = ChatGroq(api_key=Config.GROQ_API_KEY, model=Config.GROQ_MODEL, temperature=0.6)
 
-    # Track this stage's intake conversation separately (dynamic key) so
-    # viability's questions don't get confused with desirability's leftover
-    # history when the founder revisits a stage.
-    key = f"_intake_history_{stage}"
-    history = state.get(key) or []
+    # Track this stage's intake conversation separately within the single
+    # declared intake_history field, so viability's questions don't get
+    # confused with desirability's leftover history when the founder
+    # revisits a stage.
+    intake_history = state.get("intake_history") or {}
+    history = intake_history.get(stage) or []
 
     questions_so_far = sum(1 for t in history if t.get("role") == "assistant")
     if questions_so_far >= _MAX_QUESTIONS:
         state["intake_ready"] = True
         closing = {"role": "assistant", "content": f"Good enough -- let's run {stage}."}
-        state[key] = history + [closing]
+        intake_history[stage] = history + [closing]
+        state["intake_history"] = intake_history
         state["conversation_history"] = (state.get("conversation_history") or []) + [closing]
         return state
 
@@ -111,6 +113,7 @@ def intake_node(state: StartupStressTestState) -> StartupStressTestState:
 
     state["intake_ready"] = ready
     assistant_turn = {"role": "assistant", "content": message}
-    state[key] = history + [assistant_turn]
+    intake_history[stage] = history + [assistant_turn]
+    state["intake_history"] = intake_history
     state["conversation_history"] = (state.get("conversation_history") or []) + [assistant_turn]
     return state

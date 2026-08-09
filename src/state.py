@@ -59,12 +59,17 @@ class StartupStressTestState(TypedDict):
     # context for ("desirability" | "viability" | "feasibility").
     # `intake_ready` is set True by intake_node once it has asked enough
     # (or the founder has given enough) to move on to that stage's analysis.
-    # `_intake_history_<stage>` (dynamic keys, not declared here since the
-    # stage name is part of the key) hold each stage's own back-and-forth
-    # separately, so viability's questions don't get mixed into
-    # desirability's leftover conversation.
+    # `intake_history` holds each stage's own back-and-forth separately,
+    # keyed by stage name (e.g. {"desirability": [...], "viability": [...]}),
+    # so viability's questions don't get mixed into desirability's leftover
+    # conversation. This MUST be a single declared field rather than dynamic
+    # per-stage keys (e.g. "_intake_history_desirability") -- LangGraph's
+    # StateGraph only reliably persists keys declared in this TypedDict
+    # schema, so an undeclared key can silently fail to survive a
+    # checkpoint round-trip.
     intake_ready: bool
     _intake_stage: Optional[str]
+    intake_history: dict
 
     # Metadata
     search_results: Optional[List[dict]]
@@ -111,6 +116,7 @@ def create_initial_state(
         "downstream_choice": None,
         "intake_ready": False,
         "_intake_stage": "desirability",
+        "intake_history": {},
         "search_results": None,
         "conversation_history": [],
         "errors": [],

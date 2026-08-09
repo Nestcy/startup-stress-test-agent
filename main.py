@@ -30,8 +30,8 @@ def handle_intake_checkpoint(values: dict) -> dict:
     reply. Returns the state update to write back before resuming.
     """
     stage = values.get("_intake_stage", "desirability")
-    key = f"_intake_history_{stage}"
-    history = values.get(key) or []
+    intake_history = values.get("intake_history") or {}
+    history = intake_history.get(stage) or []
     last_message = history[-1]["content"] if history else "Tell me a bit more about your idea."
 
     print("\n" + "-"*80)
@@ -41,8 +41,9 @@ def handle_intake_checkpoint(values: dict) -> dict:
     answer = input("You: ").strip()
 
     conv_history = values.get("conversation_history") or []
+    intake_history[stage] = history + [{"role": "human", "content": answer}]
     return {
-        key: history + [{"role": "human", "content": answer}],
+        "intake_history": intake_history,
         "conversation_history": conv_history + [{"role": "human", "content": answer}],
     }
 
