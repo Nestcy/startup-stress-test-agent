@@ -1,52 +1,43 @@
-"""Helpers for extracting structured JSON from reasoning-model responses.
+"""Helpers for working with reasoning-model output as plain text.
 
-Models like Qwen 3.x prefix their answer with a <think>...</think> block
-containing the model's internal reasoning before the actual JSON output.
-`response.content` is therefore never valid JSON on its own -- a plain
-`json.loads(response.content)` will always fail for these models, which is
-why nodes were silently falling back to dumping the raw, unparsed response
-(thinking process and all) into state.
-
-Save this file as: src/utils/llm_json.py
+No JSON parsing anywhere in this codebase anymore -- every phase now just
+writes a plain-text analysis, and the only thing pulled out of it
+programmatically is a numeric score, via a simple regex on a "SCORE: NN/100"
+line the prompts ask the model to end with. This is far less fragile than
+requiring the model to produce valid multi-key JSON every single call: there's
+one thing to get right (one line, one number) instead of a whole schema.
 """
-import json
 import re
-from typing import Dict
 
 from src.utils.logger import logger
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+_SCORE_LINE = re.compile(r"SCORE:\s*(\d{1,3})\s*/?\s*100?", re.IGNORECASE)
 
 
-def extract_json(raw_text: str, fallback_keys: tuple = ()) -> Dict:
-    """Strip any <think>...</think> block, then parse the first JSON object
-    found in the remaining text.
-
-    Falls back to an empty dict with `fallback_keys` set to None (rather
-    than a raw_response dump) if no valid JSON can be found -- callers can
-    then use `.get(key, default)` safely without leaking unparsed model
-    reasoning into the report the founder sees.
+def strip_think(raw_text: str) -> str:
+    """Strip a <think>...</think> block from model output, leaving just the
+    actual answer. Reasoning models like Qwen always prefix their response
+    with this block; every piece of text stored in state or shown to the
+    founder should have it removed first.
     """
-    cleaned = _THINK_BLOCK.sub("", raw_text).strip()
+    return _THINK_BLOCK.sub("", raw_text or "").strip()
 
-    # Models often wrap JSON in ```json ... ``` fences even after the
-    # <think> block is removed -- strip those too if present.
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned.strip())
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # Last resort: grab the first {...} substring, in case there's stray
-    # text before/after the JSON object despite the cleanup above.
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+def extract_score(text: str, default: int = 50) -> float:
+    """Pull a numeric score out of a "SCORE: NN/100" line in plain-text
+    model output. Falls back to `default` (not 0) if no such line is found,
+    since a missing score line is a formatting slip, not evidence the idea
+    scored zero -- treating it as zero would silently make every parsing
+    hiccup look like a harsh rejection, which is exactly the failure mode
+    this whole rewrite is trying to get away from.
+    """
+    match = _SCORE_LINE.search(text or "")
     if match:
         try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
+            return float(match.group(1))
+        except ValueError:
             pass
 
-    logger.warning("Could not parse JSON from model response after cleaning. Using fallback.")
-    return {key: None for key in fallback_keys}
+    logger.warning("Could not find a 'SCORE: NN/100' line in model output. Using default score.")
+    return float(default)

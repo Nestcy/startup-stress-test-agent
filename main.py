@@ -62,6 +62,14 @@ def handle_revise(graph, config, stage: str):
     if new_description:
         values_to_clear["idea_description"] = new_description
 
+    stage_order = ["desirability", "viability", "feasibility"]
+    cutoff = stage_order.index(stage)
+    stages_to_drop = set(stage_order[cutoff:])
+    existing_history = graph.get_state(config).values.get("conversation_history") or []
+    values_to_clear["conversation_history"] = [
+        turn for turn in existing_history if turn.get("stage") not in stages_to_drop
+    ]
+
     graph.update_state(config, values_to_clear, as_node=REWIND_ANCHOR[stage])
     final_values = run_to_completion(graph, config)
     print_report(final_values)
@@ -82,7 +90,7 @@ def handle_ask(config, values: dict):
     from langchain_core.prompts import ChatPromptTemplate
     from src.utils.config import Config
 
-    llm = ChatGroq(api_key=Config.GROQ_API_KEY, model=Config.GROQ_MODEL, temperature=0.5)
+    llm = ChatGroq(api_key=Config.GROQ_API_KEY, model=Config.GROQ_MODEL, temperature=0.5, max_tokens=4000)
     prompt = ChatPromptTemplate.from_template("""
     Answer the founder's question about this completed startup evaluation.
 

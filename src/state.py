@@ -57,15 +57,12 @@ class StartupStressTestState(TypedDict):
     _confirm_source: Optional[str]
     downstream_choice: Optional[str]
 
-    # Every phase across all three stages tags its own claims as either
-    # "sourced" (backed by a live web search) or "assumption" (the model's
-    # own estimate, not confirmed). Each entry accumulates here as
-    # {stage, phase, type, claim} so the final report can show the founder
-    # exactly what's real data versus what still needs validating -- see
-    # report_node.py's "Key Assumptions to Validate" section.
-    all_assumptions: Optional[List[dict]]
-
-    # Metadata
+    # This IS the memory: each stage appends its own plain-text analysis
+    # here as {"stage": "desirability"/"viability"/"feasibility", "content": "..."}.
+    # The next stage's prompt includes this whole buffer as context, and
+    # the final report is compiled straight from it. No separate database
+    # or vector store -- it's a plain growing list of text, passed along
+    # in the LangGraph state.
     search_results: Optional[List[dict]]
     conversation_history: List[dict]
     errors: List[str]
@@ -105,7 +102,6 @@ def create_initial_state(
         "recommendation": None,
         "_confirm_source": None,
         "downstream_choice": None,
-        "all_assumptions": [],
         "search_results": None,
         "conversation_history": [],
         "errors": [],

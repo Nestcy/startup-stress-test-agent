@@ -1,6 +1,8 @@
-"""Viability evaluation node - Refined with deep financial modeling
+"""Viability evaluation node -- plain text, no JSON.
 
-Save this file as: src/nodes/viability_node.py
+Reads the desirability analysis out of the shared conversation buffer
+(state['conversation_history']) as context, then writes its own plain-prose
+analysis grounded in a live web search, ending with a "SCORE: NN/100" line.
 """
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
@@ -8,388 +10,105 @@ from src.state import StartupStressTestState, EvaluationStatus
 from src.tools.search_tool import SearchTool
 from src.utils.logger import logger
 from src.utils.config import Config
-from src.utils.llm_json import extract_json
-from typing import Dict
-import json
+from src.utils.llm_json import strip_think, extract_score
 
 
-class ViabilityAnalyzer:
-    """Advanced viability analyzer with financial modeling"""
-
-    def __init__(self):
-        self.llm = ChatGroq(
-            api_key=Config.GROQ_API_KEY,
-            model=Config.GROQ_MODEL,
-            temperature=0.7
-        )
-        self.search_tool = SearchTool()
-
-    def research_market_size(self, startup_idea: str, customer_segment: str) -> Dict:
-        """Phase 1: Research market size and customer count"""
-        logger.info("Phase 1: Researching market size...")
-
-        search_query = f"{customer_segment} market size TAM customers 2024"
-        market_data = self.search_tool.search(search_query, topic="general")
-
-        prompt = ChatPromptTemplate.from_template("""
-        Research the market size and estimate customer count.
-        
-        Startup Idea: {startup_idea}
-        Customer Segment: {customer_segment}
-        Market Research: {market_data}
-        
-        Provide:
-        1. Total Addressable Market (TAM)
-        2. Serviceable Addressable Market (SAM)
-        3. Estimated Total Customer Count (TAM and SAM)
-        4. Customer Distribution
-        5. Market Growth Rate
-        6. Market Maturity
-        
-        Format as JSON with keys: tam, sam, total_customers_tam, total_customers_sam,
-        distribution, growth_rate, maturity, sourced_claims, assumptions
-        "sourced_claims": specific numbers above drawn directly from the market research.
-        "assumptions": specific numbers above that are your own estimate, not confirmed
-        by the research.
-        """)
-
-        chain = prompt | self.llm
-        response = chain.invoke({
-            "startup_idea": startup_idea,
-            "customer_segment": customer_segment,
-            "market_data": str(market_data[:3]) if market_data else "No market data"
-        })
-
-        market_size_data = extract_json(
-            response.content,
-            fallback_keys=("tam", "sam", "total_customers_tam", "total_customers_sam", "distribution", "growth_rate", "maturity", "sourced_claims", "assumptions"),
-        )
-
-        logger.info(f"Market size researched")
-        return market_size_data
-
-    def determine_funding_strategy(self, startup_idea: str, funding_model: str = None, arr_target_input: str = None) -> Dict:
-        """Phase 2: Funding strategy and ARR goals.
-
-        No longer blocks on input(). `funding_model` and `arr_target_input`
-        are supplied by the caller (the CLI asks for them up front and passes
-        them in via state; the API accepts them as optional fields on the
-        /evaluate/start request body). Falls back to sensible defaults --
-        bootstrap / $1M ARR -- when not provided, and logs (instead of
-        interactively confirming) when a target looks mismatched with the
-        chosen funding model, so nothing here can block waiting on stdin.
-        """
-        logger.info("Phase 2: Determining funding strategy...")
-
-        funding_model = (funding_model or "bootstrap").strip().lower()
-        if funding_model not in ("bootstrap", "vc"):
-            logger.warning(f"Unrecognized funding_model '{funding_model}', defaulting to 'bootstrap'")
-            funding_model = "bootstrap"
-
-        arr_targets = {"100k": 100000, "1m": 1000000, "10m": 10000000}
-        arr_input = (arr_target_input or "1m").strip().lower().replace("$", "").replace(",", "")
-
-        if arr_input in arr_targets:
-            arr_target = arr_targets[arr_input]
-            arr_reasoning = f"Standard milestone: {arr_input} ARR"
-        else:
-            try:
-                arr_target = float(arr_input)
-                arr_reasoning = f"Custom target: ${arr_target:,.0f}"
-            except ValueError:
-                arr_target = 1000000
-                arr_reasoning = "Default: $1M (unparseable ARR target)"
-
-        if funding_model == "bootstrap" and arr_target > 5000000:
-            logger.warning(f"${arr_target:,.0f} ARR target is ambitious for a bootstrapped strategy")
-
-        if funding_model == "vc" and arr_target < 1000000:
-            logger.warning(f"${arr_target:,.0f} ARR target may not justify VC funding")
-
-        strategy_data = {
-            "funding_model": funding_model,
-            "arr_target": arr_target,
-            "arr_reasoning": arr_reasoning,
-            "timeframe_years": 3
-        }
-
-        logger.info(f"Funding strategy: {funding_model}, ARR: ${arr_target:,.0f}")
-        return strategy_data
-
-    def estimate_pricing_and_customers(self, startup_idea: str, strategy_data: Dict) -> Dict:
-        """Phase 3: Pricing and customer metrics. Formula: Active Customers = ARR / Yearly ACR
-
-        Previously this phase had no search grounding -- pricing was a pure
-        LLM guess. Now it searches for real comparable/competitor pricing
-        first, so the estimate has something to anchor to.
-        """
-        logger.info("Phase 3: Estimating pricing and customers...")
-
-        search_query = f"{startup_idea} pricing model competitors subscription cost"
-        pricing_research = self.search_tool.search(search_query, topic="general")
-
-        prompt = ChatPromptTemplate.from_template("""
-        Estimate pricing and calculate required active customers.
-        
-        Startup Idea: {startup_idea}
-        ARR Target: ${arr_target:,.0f}
-        Funding: {funding_model}
-        Pricing Research: {pricing_research}
-        
-        Provide:
-        1. Pricing Strategy (per-seat, freemium, usage-based, etc.)
-        2. Monthly/Yearly price estimation
-        3. Required active customers using: Active Customers = {arr_target:,.0f} / Yearly Customer Revenue
-        4. 3 scenarios: conservative, realistic, optimistic
-        
-        Anchor your pricing estimate to the research above wherever it's relevant --
-        real comparable pricing beats a guess. Where the research doesn't cover a
-        comparable product, say so rather than presenting a guess as confirmed.
-        
-        Format as JSON with keys: pricing_model, monthly_price, yearly_acr, scenarios,
-        sourced_claims, assumptions
-        "sourced_claims": specific numbers above drawn directly from the pricing research.
-        "assumptions": specific numbers above that are your own estimate, not confirmed
-        by the research.
-        """)
-
-        chain = prompt | self.llm
-        response = chain.invoke({
-            "startup_idea": startup_idea,
-            "arr_target": strategy_data["arr_target"],
-            "funding_model": strategy_data["funding_model"],
-            "pricing_research": str(pricing_research[:3]) if pricing_research else "No pricing data found"
-        })
-
-        pricing_data = extract_json(
-            response.content,
-            fallback_keys=("pricing_model", "monthly_price", "yearly_acr", "scenarios", "sourced_claims", "assumptions"),
-        )
-
-        logger.info("Pricing estimated")
-        return pricing_data
-
-    def research_churn_rate(self, customer_segment: str, industry: str) -> Dict:
-        """Phase 4: Churn research. Formula: Churn Rate = 1 / Customer Lifetime (months)"""
-        logger.info("Phase 4: Researching churn rates...")
-
-        search_query = f"{industry} SaaS customer churn retention benchmark"
-        churn_data = self.search_tool.search(search_query, topic="general")
-
-        prompt = ChatPromptTemplate.from_template("""
-        Research industry churn benchmarks.
-        
-        Customer Segment: {customer_segment}
-        Industry: {industry}
-        
-        Provide:
-        1. Benchmark Churn Rate
-        2. Customer Lifetime (months)
-        3. Formula: Churn = 1 / Lifetime (months)
-        4. Factors affecting churn
-        5. Improvement opportunities
-        6. 3 scenarios: high churn, realistic, low churn
-        
-        Format as JSON with keys: benchmark_churn, customer_lifetime_months, scenarios,
-        sourced_claims, assumptions
-        "sourced_claims": specific numbers above drawn directly from the churn research.
-        "assumptions": specific numbers above that are your own estimate, not confirmed
-        by the research.
-        """)
-
-        chain = prompt | self.llm
-        response = chain.invoke({
-            "customer_segment": customer_segment,
-            "industry": industry
-        })
-
-        churn_research = extract_json(
-            response.content,
-            fallback_keys=("benchmark_churn", "customer_lifetime_months", "scenarios", "sourced_claims", "assumptions"),
-        )
-
-        logger.info("Churn research completed")
-        return churn_research
-
-    def calculate_customer_acquisition_funnel(self, startup_idea: str, pricing_data: Dict, churn_data: Dict) -> Dict:
-        """Phase 5: Customer acquisition funnel - The Customer Factory.
-
-        Previously this phase had no search grounding -- CAC/LTV benchmarks
-        and conversion rates were pure LLM guesses. Now it searches for real
-        industry CAC/conversion benchmarks first.
-        """
-        logger.info("Phase 5: Calculating acquisition funnel...")
-
-        search_query = f"{startup_idea} customer acquisition cost CAC conversion rate benchmark industry"
-        funnel_research = self.search_tool.search(search_query, topic="general")
-
-        prompt = ChatPromptTemplate.from_template("""
-        Calculate the customer acquisition funnel.
-        
-        Startup Idea: {startup_idea}
-        Acquisition/CAC Research: {funnel_research}
-        
-        Design:
-        1. Acquisition Rate: User acquisition
-        2. Activation Rate: Trial/pilot conversion (10-30%)
-        3. Revenue Rate: Trial to paying (5-15%)
-        4. Overall Conversion: Leads to Customers (~1%)
-        
-        Calculate:
-        - Monthly leads needed
-        - CAC (Customer Acquisition Cost)
-        - LTV (Lifetime Value)
-        - Payback Period
-        - Referral impact
-        
-        Anchor CAC and conversion-rate assumptions to the research above wherever
-        it's relevant, rather than using generic industry rules of thumb by default.
-        
-        Provide 3 scenarios: conservative, realistic, aggressive
-        
-        Format as JSON with keys: acquisition_rate, activation_rate, revenue_rate,
-        scenarios, referral_impact, sourced_claims, assumptions
-        "sourced_claims": specific numbers above drawn directly from the research above.
-        "assumptions": specific numbers above that are your own estimate/rule-of-thumb,
-        not confirmed by the research.
-        """)
-
-        chain = prompt | self.llm
-        response = chain.invoke({
-            "startup_idea": startup_idea,
-            "funnel_research": str(funnel_research[:3]) if funnel_research else "No CAC/conversion data found"
-        })
-
-        funnel_data = extract_json(
-            response.content,
-            fallback_keys=("acquisition_rate", "activation_rate", "revenue_rate", "scenarios", "referral_impact", "sourced_claims", "assumptions"),
-        )
-
-        logger.info("Acquisition funnel calculated")
-        return funnel_data
-
-    def generate_viability_assessment(self, market_data: Dict, strategy_data: Dict, pricing_data: Dict,
-                                     churn_data: Dict, funnel_data: Dict) -> Dict:
-        """Phase 6: Generate viability assessment"""
-        logger.info("Phase 6: Generating viability assessment...")
-
-        prompt = ChatPromptTemplate.from_template("""
-        Generate viability assessment (0-100).
-        
-        Market Data: {market_data}
-        Funding Strategy: {strategy_data}
-        Pricing Data: {pricing_data}
-        Churn Data: {churn_data}
-        Acquisition Funnel: {funnel_data}
-        
-        SCORING PHILOSOPHY (read this before scoring): Score the underlying business
-        model against what the research above found -- real market size, real
-        comparable pricing, real churn benchmarks, real CAC data. Do NOT penalize the
-        idea merely because the founder hasn't yet built the product or signed
-        customers -- every pre-launch idea is in that position, and it isn't a
-        business-model flaw. If the research supports a workable model (sufficient
-        market, defensible pricing, plausible unit economics), score that on its
-        merits. Reserve low scores for cases where the research itself shows a weak
-        model -- e.g. market too small, pricing unsupported by comparables, CAC/LTV
-        that doesn't work even under a realistic scenario.
-        
-        Assess:
-        1. Business Model Soundness (25 pts): Pricing, CAC/LTV, payback
-        2. Market Opportunity (25 pts): TAM sufficiency, achievable customers, growth
-        3. Unit Economics (25 pts): Revenue per customer, churn, margins
-        4. Go-to-Market (25 pts): Funnel achievable, referrals viable, realistic CAC
-        
-        Provide:
-        - Viability Score (0-100)
-        - Score breakdown
-        - Financial metrics summary
-        - Strengths and risks
-        - Assumptions to validate (things the research didn't confirm -- not "this
-          hasn't launched yet" as a blanket statement)
-        - Funding model fit
-        
-        Format as JSON with keys: overall_score, breakdown, financial_summary, strengths, risks, assumptions, funding_fit
-        """)
-
-        chain = prompt | self.llm
-        response = chain.invoke({
-            "market_data": json.dumps(market_data),
-            "strategy_data": json.dumps(strategy_data),
-            "pricing_data": json.dumps(pricing_data),
-            "churn_data": json.dumps(churn_data),
-            "funnel_data": json.dumps(funnel_data)
-        })
-
-        viability_assessment = extract_json(
-            response.content,
-            fallback_keys=("overall_score", "breakdown", "financial_summary", "strengths", "risks", "assumptions", "funding_fit"),
-        )
-
-        logger.info(f"Viability Score: {viability_assessment.get('overall_score', 0)}/100")
-        return viability_assessment
+def _format_buffer(history: list) -> str:
+    if not history:
+        return "(no prior analysis yet)"
+    return "\n\n".join(f"--- {turn['stage'].upper()} ---\n{turn['content']}" for turn in history)
 
 
-from src.nodes.desirability_node import _collect_provenance
+def _resolve_arr_target(arr_target_input: str) -> tuple:
+    """Turn '100k' / '1m' / '10m' / a raw number into an actual dollar figure."""
+    arr_targets = {"100k": 100000, "1m": 1000000, "10m": 10000000}
+    normalized = (arr_target_input or "1m").strip().lower().replace("$", "").replace(",", "")
+
+    if normalized in arr_targets:
+        return arr_targets[normalized], f"Standard milestone: {normalized} ARR"
+    try:
+        return float(normalized), f"Custom target: ${float(normalized):,.0f}"
+    except ValueError:
+        return 1000000, "Default: $1M (unparseable ARR target)"
+
+
+_PROMPT = ChatPromptTemplate.from_template("""
+You're a startup advisor assessing VIABILITY: does this work as a business?
+
+Startup Idea: {startup_idea}
+Funding approach: {funding_model}
+3-year ARR target: ${arr_target:,.0f}
+
+Prior analysis so far (use this as context, don't repeat it):
+{conversation_buffer}
+
+Recent web research on market size, pricing, and unit economics for this kind of product:
+{search_data}
+
+Write a clear, honest analysis covering:
+- Market size: is there realistically enough market to hit the ARR target?
+- Pricing: what would this actually charge, anchored to comparable products in the
+  research above wherever possible
+- Customers needed: roughly how many paying customers get to the ARR target at that price
+- Churn and customer lifetime: use real industry benchmarks from the research where you
+  can find them
+- Customer acquisition: realistic CAC, LTV, and payback period
+- Whether the funding approach ({funding_model}) actually fits this model
+
+IMPORTANT SCORING RULE: don't penalize this idea for not having launched yet -- every
+idea evaluated here is pre-revenue by definition. Score the underlying business model
+against what the research supports (real market size, real comparable pricing, real
+unit economics) -- not against whether the founder has already proven it. Only score
+low where the research itself shows the model doesn't work (market too small, pricing
+unsupported, economics that don't close even in a realistic scenario).
+
+Write in plain prose (a few clear paragraphs, markdown headers are fine). Do not use
+JSON. End your response with exactly one line in this format:
+SCORE: NN/100
+""")
 
 
 def viability_node(state: StartupStressTestState) -> StartupStressTestState:
-    """Comprehensive viability evaluation node."""
+    """Run the viability assessment and append it to the conversation buffer."""
     logger.info(f"Starting viability evaluation for: {state['startup_idea']}")
 
-    analyzer = ViabilityAnalyzer()
-
-    customer_segment = "target market"
-    industry = state['startup_idea']
-
-    market_data = analyzer.research_market_size(state['startup_idea'], customer_segment)
-    strategy_data = analyzer.determine_funding_strategy(
-        state['startup_idea'],
-        funding_model=state.get('funding_model'),
-        arr_target_input=state.get('arr_target'),
+    search_tool = SearchTool()
+    llm = ChatGroq(
+        api_key=Config.GROQ_API_KEY,
+        model=Config.GROQ_MODEL,
+        temperature=0.7,
+        max_tokens=8000,
     )
-    pricing_data = analyzer.estimate_pricing_and_customers(state['startup_idea'], strategy_data)
-    churn_data = analyzer.research_churn_rate(customer_segment, industry)
-    funnel_data = analyzer.calculate_customer_acquisition_funnel(state['startup_idea'], pricing_data, churn_data)
-    viability_assessment = analyzer.generate_viability_assessment(market_data, strategy_data, pricing_data, churn_data, funnel_data)
 
-    provenance = []
-    provenance += _collect_provenance("viability", "market_size", market_data)
-    provenance += _collect_provenance("viability", "pricing", pricing_data)
-    provenance += _collect_provenance("viability", "churn", churn_data)
-    provenance += _collect_provenance("viability", "acquisition_funnel", funnel_data)
-    for claim in (viability_assessment.get("assumptions") or []):
-        provenance.append({"stage": "viability", "phase": "scoring", "type": "assumption", "claim": claim})
+    funding_model = (state.get('funding_model') or 'bootstrap').strip().lower()
+    if funding_model not in ('bootstrap', 'vc'):
+        funding_model = 'bootstrap'
+    arr_target, _ = _resolve_arr_target(state.get('arr_target'))
 
-    analysis_report = f"""
-    ============================================
-    COMPREHENSIVE VIABILITY ANALYSIS
-    ============================================
-    
-    PHASE 1: MARKET SIZE RESEARCH
-    {json.dumps(market_data, indent=2)}
-    
-    PHASE 2: FUNDING STRATEGY & ARR GOALS
-    {json.dumps(strategy_data, indent=2)}
-    
-    PHASE 3: PRICING & CUSTOMER METRICS
-    {json.dumps(pricing_data, indent=2)}
-    
-    PHASE 4: CHURN RATE & CUSTOMER LIFETIME
-    {json.dumps(churn_data, indent=2)}
-    
-    PHASE 5: CUSTOMER ACQUISITION FUNNEL
-    {json.dumps(funnel_data, indent=2)}
-    
-    PHASE 6: VIABILITY ASSESSMENT
-    {json.dumps(viability_assessment, indent=2)}
-    ============================================
-    """
+    search_query = f"{state['startup_idea']} pricing competitors churn CAC benchmark market size"
+    results = search_tool.search(search_query, topic="general")
+    search_data = "\n".join(
+        f"- {r.get('title', '')}: {r.get('content', '')[:400]}" for r in (results or [])[:5]
+    ) or "No search results found for this query."
 
-    state['viability_analysis'] = analysis_report
+    chain = _PROMPT | llm
+    response = chain.invoke({
+        "startup_idea": state['startup_idea'],
+        "funding_model": funding_model,
+        "arr_target": arr_target,
+        "conversation_buffer": _format_buffer(state.get('conversation_history') or []),
+        "search_data": search_data,
+    })
+
+    analysis = strip_think(response.content)
+    score = extract_score(analysis)
+
+    state['viability_analysis'] = analysis
     state['viability_status'] = EvaluationStatus.COMPLETED
-    state['viability_score'] = viability_assessment.get('overall_score', 0)
-    existing_provenance = [a for a in (state.get('all_assumptions') or []) if a.get('stage') != 'viability']
-    state['all_assumptions'] = existing_provenance + provenance
+    state['viability_score'] = score
+    state['conversation_history'] = (state.get('conversation_history') or []) + [
+        {"stage": "viability", "content": analysis}
+    ]
 
-    logger.info(f"Viability evaluation completed. Score: {state['viability_score']}")
+    logger.info(f"Viability evaluation completed. Score: {score}")
     return state

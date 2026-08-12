@@ -319,6 +319,18 @@ def revise_evaluation(thread_id: str, payload: ReviseRequest):
     if payload.idea_description:
         values_to_clear["idea_description"] = payload.idea_description
 
+    # The stage being revised (and everything after it, in stage order) is
+    # about to be re-run and re-appended to the conversation buffer -- strip
+    # its old entries out first, or the buffer would carry a stale, out of
+    # date copy alongside the fresh one.
+    stage_order = ["desirability", "viability", "feasibility"]
+    cutoff = stage_order.index(payload.stage)
+    stages_to_drop = set(stage_order[cutoff:])
+    existing_history = snapshot.values.get("conversation_history") or []
+    values_to_clear["conversation_history"] = [
+        turn for turn in existing_history if turn.get("stage") not in stages_to_drop
+    ]
+
     anchor = REWIND_ANCHOR[payload.stage]
     logger.info(f"[{thread_id}] Revising from '{payload.stage}', rewinding to anchor '{anchor}'")
 
@@ -389,7 +401,7 @@ def ask_followup(thread_id: str, payload: AskRequest):
     values = snapshot.values
     used_search, search_context = maybe_search(payload.question)
 
-    llm = ChatGroq(api_key=Config.GROQ_API_KEY, model=Config.GROQ_MODEL, temperature=0.5)
+    llm = ChatGroq(api_key=Config.GROQ_API_KEY, model=Config.GROQ_MODEL, temperature=0.5, max_tokens=4000)
     chain = _ASK_PROMPT | llm
 
     logger.info(f"[{thread_id}] Follow-up question: {payload.question}")

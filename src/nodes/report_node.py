@@ -1,102 +1,85 @@
-"""Final report generation node"""
+"""Final report generation node -- compiles the conversation buffer
+(desirability, viability, feasibility analyses) into a single markdown
+report. This is the artifact the founder actually reads.
+"""
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from src.state import StartupStressTestState
 from src.utils.logger import logger
 from src.utils.config import Config
+from src.utils.llm_json import strip_think
 
 
-def _build_assumptions_section(all_assumptions: list) -> str:
-    """Build a markdown section listing every claim the evaluation made,
-    split into what's backed by a live search versus what the model
-    estimated on its own -- so the founder knows exactly which numbers in
-    this report to trust and which to go verify themselves.
-    """
-    if not all_assumptions:
-        return ""
+_PROMPT = ChatPromptTemplate.from_template("""
+Write an executive summary report for this startup evaluation, in markdown.
 
-    sourced = [a for a in all_assumptions if a.get("type") == "sourced"]
-    assumed = [a for a in all_assumptions if a.get("type") == "assumption"]
+Startup Idea: {startup_idea}
 
-    lines = ["\n## Data Sources & Key Assumptions\n"]
-    lines.append(
-        f"This evaluation drew on {len(sourced)} claim(s) grounded in live web research "
-        f"and {len(assumed)} claim(s) that are the model's own estimate. Treat the "
-        f"assumptions below as the first things to validate yourself.\n"
-    )
+Scores:
+- Desirability: {desirability_score}/100
+- Viability: {viability_score}/100
+- Feasibility: {feasibility_score}/100
+- Overall: {overall_score}/100
 
-    if assumed:
-        lines.append("### Assumptions to validate\n")
-        for a in assumed:
-            lines.append(f"- **[{a.get('stage', '?')} / {a.get('phase', '?')}]** {a.get('claim', '')}")
+Full analysis from each stage:
+{conversation_buffer}
 
-    if sourced:
-        lines.append("\n### Backed by research\n")
-        for a in sourced:
-            lines.append(f"- **[{a.get('stage', '?')} / {a.get('phase', '?')}]** {a.get('claim', '')}")
+Write, in this order:
+1. Executive Summary (2-3 sentences)
+2. Stress Test Results (a markdown table with the four scores above)
+3. Key Strengths (3-4 bullets, grounded in what the analysis above actually found)
+4. Key Risks (3-4 bullets, same)
+5. Critical Success Factors
+6. Recommended Next Steps
+7. Go/No-Go Recommendation with a short justification
 
-    return "\n".join(lines)
+Base every claim on the analysis above -- don't introduce new facts. Write in plain
+markdown prose, no JSON.
+""")
 
 
 def generate_final_report(state: StartupStressTestState) -> StartupStressTestState:
-    """Generate comprehensive final report with all evaluations and recommendation."""
+    """Generate the final report from the accumulated conversation buffer."""
     logger.info(f"Generating final report for: {state['startup_idea']}")
-    
+
     llm = ChatGroq(
         api_key=Config.GROQ_API_KEY,
         model=Config.GROQ_MODEL,
-        temperature=0.7
+        temperature=0.7,
+        max_tokens=8000,
     )
-    
+
     scores = [
         state.get('desirability_score') or 0,
         state.get('viability_score') or 0,
-        state.get('feasibility_score') or 0
+        state.get('feasibility_score') or 0,
     ]
     overall_score = sum(scores) / len(scores) if scores else 0
     state['overall_score'] = overall_score
-    
-    prompt = ChatPromptTemplate.from_template("""
-    Create executive summary report for startup evaluation.
-    
-    Startup Idea: {startup_idea}
-    
-    Scores:
-    - Desirability: {desirability_score}/100
-    - Viability: {viability_score}/100
-    - Feasibility: {feasibility_score}/100
-    - Overall: {overall_score}/100
-    
-    Generate:
-    1. Executive Summary (2-3 sentences)
-    2. Stress Test Results (table with scores)
-    3. Key Strengths (3-4 bullets)
-    4. Key Risks (3-4 bullets)
-    5. Critical Success Factors
-    6. Recommended Next Steps
-    7. Go/No-Go Recommendation with justification
-    
-    Use markdown formatting.
-    """)
-    
-    chain = prompt | llm
+
+    history = state.get('conversation_history') or []
+    conversation_buffer = "\n\n".join(
+        f"--- {turn['stage'].upper()} ---\n{turn['content']}" for turn in history
+    ) or "(no analysis available)"
+
+    chain = _PROMPT | llm
     response = chain.invoke({
         "startup_idea": state['startup_idea'],
         "desirability_score": state.get('desirability_score', 0),
         "viability_score": state.get('viability_score', 0),
         "feasibility_score": state.get('feasibility_score', 0),
-        "overall_score": overall_score
+        "overall_score": overall_score,
+        "conversation_buffer": conversation_buffer,
     })
-    
-    assumptions_section = _build_assumptions_section(state.get('all_assumptions') or [])
-    state['final_report'] = response.content + assumptions_section
-    
+
+    state['final_report'] = strip_think(response.content)
+
     if overall_score >= 70:
         state['recommendation'] = "GO - Strong potential, proceed with next phase"
     elif overall_score >= 50:
         state['recommendation'] = "CONDITIONAL - Requires refinement in key areas"
     else:
         state['recommendation'] = "NO-GO - Significant concerns, reconsider approach"
-    
+
     logger.info(f"Final report generated. Overall Score: {overall_score}/100")
     return state
