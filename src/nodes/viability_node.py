@@ -282,6 +282,17 @@ class ViabilityAnalyzer:
         Churn Data: {churn_data}
         Acquisition Funnel: {funnel_data}
         
+        SCORING PHILOSOPHY (read this before scoring): Score the underlying business
+        model against what the research above found -- real market size, real
+        comparable pricing, real churn benchmarks, real CAC data. Do NOT penalize the
+        idea merely because the founder hasn't yet built the product or signed
+        customers -- every pre-launch idea is in that position, and it isn't a
+        business-model flaw. If the research supports a workable model (sufficient
+        market, defensible pricing, plausible unit economics), score that on its
+        merits. Reserve low scores for cases where the research itself shows a weak
+        model -- e.g. market too small, pricing unsupported by comparables, CAC/LTV
+        that doesn't work even under a realistic scenario.
+        
         Assess:
         1. Business Model Soundness (25 pts): Pricing, CAC/LTV, payback
         2. Market Opportunity (25 pts): TAM sufficiency, achievable customers, growth
@@ -293,7 +304,8 @@ class ViabilityAnalyzer:
         - Score breakdown
         - Financial metrics summary
         - Strengths and risks
-        - Assumptions to validate
+        - Assumptions to validate (things the research didn't confirm -- not "this
+          hasn't launched yet" as a blanket statement)
         - Funding model fit
         
         Format as JSON with keys: overall_score, breakdown, financial_summary, strengths, risks, assumptions, funding_fit

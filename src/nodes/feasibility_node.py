@@ -193,6 +193,15 @@ class FeasibilityAnalyzer:
         Traction Roadmap: {traction_roadmap}
         Rollout Plan: {rollout_plan}
         
+        SCORING PHILOSOPHY (read this before scoring): Score whether this idea is
+        buildable and executable with a reasonable team and timeline, based on the
+        technical research above. Do NOT penalize the idea for not having a team or
+        codebase yet -- that's true of every pre-launch idea and isn't itself a
+        feasibility flaw. Score low only where the technology itself is genuinely
+        hard to build (e.g. requires research-grade AI, regulatory approval, physical
+        infrastructure) or the plan is genuinely unrealistic -- not merely because
+        nothing has been built yet.
+        
         Assess:
         1. Technical Feasibility (25 pts): Can tech be built? Realistic timeline?
         2. Execution Feasibility (25 pts): Team can execute? Resources clear?

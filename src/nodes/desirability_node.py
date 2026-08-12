@@ -54,7 +54,10 @@ class DesirabilityAnalyzer:
         
         Use the market research above wherever it's relevant -- don't ignore it in
         favor of a guess. Where the research doesn't cover something, say so plainly
-        rather than presenting a guess as if it were confirmed.
+        rather than presenting a guess as if it were confirmed. Do not frame the
+        absence of the founder's own interviews or waitlist as a weakness of the
+        idea -- this evaluation's job is to substitute market research for that,
+        not to penalize a pre-launch idea for being pre-launch.
         
         Format as JSON with keys: segment, profile, tam, pain_level, willingness_to_pay,
         sourced_claims, assumptions
@@ -197,11 +200,18 @@ class DesirabilityAnalyzer:
         Competitor Research: {competitor_data}
         
         Evaluate:
-        1. Problem Validation: Are these real problems?
+        1. Problem Validation: Does the market research support that this is a real,
+           painful problem? Base this on the research provided -- NOT on whether the
+           founder has personally run interviews or built a waitlist. This tool's job
+           is to gather that evidence via search on the founder's behalf; a founder
+           testing a pre-launch idea will never have primary research of their own,
+           and that is not itself a weakness to penalize.
         2. Solution Uniqueness: How does this solution differ?
         3. Solution-Problem Fit: Does solution actually solve problems?
         4. Adoption Advantage: Why would customers switch?
-        5. Desirability Risk Assessment
+        5. Desirability Risk Assessment: real risks specific to this idea and market --
+           not "the founder hasn't validated this yet," which is true of every
+           pre-launch idea and not a meaningful risk signal on its own.
         
         Ground the uniqueness and adoption-advantage claims in the competitor research
         above wherever it's relevant, rather than relying purely on general knowledge
@@ -243,8 +253,22 @@ class DesirabilityAnalyzer:
         Existing Alternatives: {alternatives_data}
         Solution Fit: {solution_fit_data}
         
+        SCORING PHILOSOPHY (read this before scoring): This score should reflect the
+        strength of the market opportunity that the research above actually found --
+        real customer pain, real market timing, real competitive gaps, real solution
+        fit. It should NOT be a penalty for the founder's execution stage. Every
+        pre-launch idea lacks the founder's own interviews, waitlist, or paying
+        customers -- that is true by definition and is not itself evidence the idea
+        is bad. If the research above surfaces a real, well-timed customer need and
+        a defensible angle on it, score that opportunity on its merits, even though
+        the founder hasn't personally validated it yet. Only score low where the
+        research itself turned up weak demand, saturated competition, or a poor
+        solution fit -- not merely because "no primary evidence" exists, since that
+        phrase describes every idea at this stage.
+        
         Evaluate by:
-        1. Customer Demand (25 points): TAM, pain level, willingness to pay
+        1. Customer Demand (25 points): TAM, pain level, willingness to pay -- based on
+           what the research found, not on founder-run validation
         2. Market Timing (25 points): Shifts and switching triggers
         3. Competitive Positioning (25 points): Satisfaction gaps, uniqueness
         4. Solution-Problem Fit (25 points): Coverage and adoption advantage
@@ -253,7 +277,9 @@ class DesirabilityAnalyzer:
         - Overall Desirability Score (0-100)
         - Score breakdown by category
         - Key strengths and risks
-        - Critical assumptions to validate
+        - Critical assumptions to validate (things the research didn't confirm, that
+          the founder should go verify -- not "founder hasn't validated this yet" as
+          a blanket statement)
         - Recommended validation experiments
         
         Format as JSON with keys: overall_score, breakdown, strengths, risks, assumptions, validation_experiments
