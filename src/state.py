@@ -8,36 +8,38 @@ class EvaluationStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
-    APPROVED = "approved"
-    NEEDS_REVISION = "needs_revision"
-    REJECTED = "rejected"
 
 
 class StartupStressTestState(TypedDict):
-    """State for startup stress test evaluation"""
+    """State for startup stress test evaluation.
+
+    The pipeline runs straight through -- desirability -> viability ->
+    feasibility -> report -- with each stage's own search calls (see the
+    node files) gathering real market/tech data to ground its assumptions,
+    rather than pausing for a human at every step. The founder only steps
+    in at the end: reviewing the final report, asking questions, and
+    revising a specific stage if something needs refining.
+    """
     # Input
     startup_idea: str
     idea_description: str
 
-    # Desirability Gate
+    # Desirability
     desirability_analysis: Optional[str]
     desirability_status: EvaluationStatus
     desirability_score: Optional[float]
-    desirability_human_feedback: Optional[str]
 
-    # Viability Gate
+    # Viability
     viability_analysis: Optional[str]
     viability_status: EvaluationStatus
     viability_score: Optional[float]
-    viability_human_feedback: Optional[str]
     funding_model: Optional[str]  # "bootstrap" or "vc"; defaults to "bootstrap" if not set
     arr_target: Optional[str]     # e.g. "100k", "1m", "10m", or a raw number as a string; defaults to "1m"
 
-    # Feasibility Gate
+    # Feasibility
     feasibility_analysis: Optional[str]
     feasibility_status: EvaluationStatus
     feasibility_score: Optional[float]
-    feasibility_human_feedback: Optional[str]
 
     # Final Report
     final_report: Optional[str]
@@ -50,26 +52,18 @@ class StartupStressTestState(TypedDict):
     # routing function knows whether "reevaluate" means go to viability
     # (came from a desirability revise) or feasibility (came from a
     # viability revise). `downstream_choice` holds the founder's answer:
-    # "reevaluate" or "keep".
+    # "reevaluate" or "keep". This is the ONLY point in the whole graph
+    # that ever pauses -- everything else runs straight through.
     _confirm_source: Optional[str]
     downstream_choice: Optional[str]
 
-    # Conversational intake, run once before each of the three stages.
-    # `_intake_stage` records which stage the agent is currently gathering
-    # context for ("desirability" | "viability" | "feasibility").
-    # `intake_ready` is set True by intake_node once it has asked enough
-    # (or the founder has given enough) to move on to that stage's analysis.
-    # `intake_history` holds each stage's own back-and-forth separately,
-    # keyed by stage name (e.g. {"desirability": [...], "viability": [...]}),
-    # so viability's questions don't get mixed into desirability's leftover
-    # conversation. This MUST be a single declared field rather than dynamic
-    # per-stage keys (e.g. "_intake_history_desirability") -- LangGraph's
-    # StateGraph only reliably persists keys declared in this TypedDict
-    # schema, so an undeclared key can silently fail to survive a
-    # checkpoint round-trip.
-    intake_ready: bool
-    _intake_stage: Optional[str]
-    intake_history: dict
+    # Every phase across all three stages tags its own claims as either
+    # "sourced" (backed by a live web search) or "assumption" (the model's
+    # own estimate, not confirmed). Each entry accumulates here as
+    # {stage, phase, type, claim} so the final report can show the founder
+    # exactly what's real data versus what still needs validating -- see
+    # report_node.py's "Key Assumptions to Validate" section.
+    all_assumptions: Optional[List[dict]]
 
     # Metadata
     search_results: Optional[List[dict]]
@@ -98,25 +92,20 @@ def create_initial_state(
         "desirability_analysis": None,
         "desirability_status": EvaluationStatus.PENDING,
         "desirability_score": None,
-        "desirability_human_feedback": None,
         "viability_analysis": None,
         "viability_status": EvaluationStatus.PENDING,
         "viability_score": None,
-        "viability_human_feedback": None,
         "funding_model": funding_model,
         "arr_target": arr_target,
         "feasibility_analysis": None,
         "feasibility_status": EvaluationStatus.PENDING,
         "feasibility_score": None,
-        "feasibility_human_feedback": None,
         "final_report": None,
         "overall_score": None,
         "recommendation": None,
         "_confirm_source": None,
         "downstream_choice": None,
-        "intake_ready": False,
-        "_intake_stage": "desirability",
-        "intake_history": {},
+        "all_assumptions": [],
         "search_results": None,
         "conversation_history": [],
         "errors": [],

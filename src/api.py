@@ -1,24 +1,24 @@
 """HTTP API for the startup stress test agent.
 
-Why this works (first principles):
+Flow: POST /evaluate/start runs the entire pipeline -- desirability ->
+viability -> feasibility -> report -- in one shot and returns the finished
+report. There's no mid-run pausing; each stage node does its own web
+research to ground its scoring in real data (see the node files), so the
+founder doesn't need to feed it anything beyond the initial idea and
+description.
 
-LangGraph's `interrupt_before` pauses execution right before a named node
-runs. A `checkpointer` is what makes that pause survive past the current
-Python call stack -- it writes a snapshot of the state to storage, keyed by
-`thread_id`, after every node. As long as the same checkpointer instance
-(and thread_id) is used on a later call, `graph.invoke(None, config)` picks
-the run back up exactly where it left off. That's the whole mechanism that
-lets a request start an evaluation, return immediately at the first
-checkpoint, and let a *different, later* HTTP request supply the founder's
-response and carry the run forward.
-
-The `graph` and `checkpointer` below are created once at module import time
-(not per-request) precisely so that state persists *across* requests within
-this running process.
+The founder interacts with a finished evaluation two ways:
+- POST /evaluate/{id}/ask -- ask questions about the result. Can trigger a
+  live web search if the question needs current info (see smart_search.py).
+- POST /evaluate/{id}/revise -- redo a specific stage with updated input,
+  keeping the same thread_id so the other stages' results aren't lost. If
+  later stages already have results from the prior run, the graph pauses
+  at confirm_downstream to ask whether to redo those too.
 
 Persistence: if `DATABASE_URL` is set (Railway's Postgres addon sets this
-automatically once attached), state is stored in Postgres, so it survives
-restarts/redeploys and works with more than one worker. If unset, this falls
+automatically once attached), state is stored in Postgres, so a completed
+evaluation's thread_id can still be looked up (for /ask, /revise) after a
+restart/redeploy, and works with more than one worker. If unset, this falls
 back to `InMemorySaver` for local dev only -- state is lost on restart, and
 it's only safe with a single worker.
 """
@@ -41,11 +41,6 @@ from src.utils.config import Config
 from src.utils.smart_search import maybe_search
 
 # --- Graph + checkpointer: created once, reused across all requests ---
-# `EvaluationStatus` (in src/state.py) is a custom Enum stored in state, so it
-# gets written into every checkpoint. Registering it here avoids relying on
-# langgraph's permissive-but-deprecated default for unregistered types --
-# recent langgraph versions warn that unregistered types will eventually be
-# rejected outright, which would break every checkpoint read/write.
 _serde = JsonPlusSerializer(allowed_msgpack_modules=[("src.state", "EvaluationStatus")])
 
 if Config.DATABASE_URL:
@@ -61,46 +56,16 @@ else:
 
 graph = build_graph(
     checkpointer=checkpointer,
-    interrupt_before=[
-        "await_intake_response",
-        "human_review_desirability",
-        "human_review_viability",
-        "human_review_feasibility",
-        "confirm_downstream",
-    ],
+    interrupt_before=["confirm_downstream"],
 )
 
-# Maps the node the graph is currently paused before -> a human-readable stage
-NODE_TO_STAGE = {
-    "await_intake_response": "intake",
-    "human_review_desirability": "desirability",
-    "human_review_viability": "viability",
-    "human_review_feasibility": "feasibility",
-    "confirm_downstream": "confirm_downstream",
-}
-
-# Which state fields hold the analysis/score to show the reviewer at each stage
-STAGE_ANALYSIS_FIELDS = {
-    "desirability": ("desirability_analysis", "desirability_score"),
-    "viability": ("viability_analysis", "viability_score"),
-    "feasibility": ("feasibility_analysis", "feasibility_score"),
-}
-
-# Which state field a stage's feedback should be written into before resuming
-STAGE_FEEDBACK_FIELDS = {
-    "desirability": "desirability_human_feedback",
-    "viability": "viability_human_feedback",
-    "feasibility": "feasibility_human_feedback",
-}
-
 # Which node to "pretend just finished" (via update_state(..., as_node=X))
-# so that invoke(None, config) re-runs the target stage's intake next.
-# Desirability is the entry point, so rewinding to it means pretending
-# we're at START (which leads into desirability's intake).
+# so that invoke(None, config) re-runs the target stage next. Desirability
+# is the entry point, so rewinding to it means pretending we're at START.
 REWIND_ANCHOR = {
     "desirability": START,
-    "viability": "human_review_desirability",
-    "feasibility": "human_review_viability",
+    "viability": "desirability",
+    "feasibility": "viability",
 }
 
 # Fields to clear on the stage being revised. Downstream stages are
@@ -109,15 +74,15 @@ REWIND_ANCHOR = {
 # keeping stale data.
 STAGE_FIELDS_TO_CLEAR = {
     "desirability": [
-        "desirability_analysis", "desirability_score", "desirability_human_feedback",
+        "desirability_analysis", "desirability_score",
         "final_report", "overall_score", "recommendation", "downstream_choice",
     ],
     "viability": [
-        "viability_analysis", "viability_score", "viability_human_feedback",
+        "viability_analysis", "viability_score",
         "final_report", "overall_score", "recommendation", "downstream_choice",
     ],
     "feasibility": [
-        "feasibility_analysis", "feasibility_score", "feasibility_human_feedback",
+        "feasibility_analysis", "feasibility_score",
         "final_report", "overall_score", "recommendation",
     ],
 }
@@ -134,13 +99,11 @@ STAGE_PREREQUISITES = {
 
 app = FastAPI(
     title="Startup Stress Test Agent API",
-    description="Conversational, human-in-the-loop startup evaluation: desirability -> viability -> feasibility -> report.",
-    version="1.1.0",
+    description="Search-grounded startup evaluation: desirability -> viability -> feasibility -> report, "
+                "then founder review, revision, and Q&A.",
+    version="2.0.0",
 )
 
-# Lovable (or any browser-based frontend) calls this API cross-origin.
-# Set ALLOWED_ORIGINS to a comma-separated list of your Lovable app URL(s) in
-# production; defaults to "*" so it works out of the box.
 _allowed_origins = os.getenv("ALLOWED_ORIGINS", "*")
 app.add_middleware(
     CORSMiddleware,
@@ -164,14 +127,6 @@ class StartRequest(BaseModel):
     )
 
 
-class RespondRequest(BaseModel):
-    answer: str = Field(..., min_length=1, description="Founder's reply to the agent's intake question")
-
-
-class FeedbackRequest(BaseModel):
-    feedback: str = Field(default="", description="Reviewer's free-text feedback for the current stage")
-
-
 class ReviseRequest(BaseModel):
     stage: str = Field(..., description="'desirability', 'viability', or 'feasibility'")
     idea_description: Optional[str] = Field(
@@ -184,11 +139,7 @@ class ConfirmDownstreamRequest(BaseModel):
 
 
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, description="Founder's follow-up question about a completed evaluation")
-
-
-class DiscussRequest(BaseModel):
-    question: str = Field(..., min_length=1, description="Founder's question about the currently-paused stage's analysis")
+    question: str = Field(..., min_length=1, description="Founder's question about the evaluation")
 
 
 class AskResponse(BaseModel):
@@ -200,14 +151,18 @@ class AskResponse(BaseModel):
 class EvaluationResponse(BaseModel):
     thread_id: str
     startup_idea: str
-    status: str  # "awaiting_response" | "awaiting_review" | "completed"
-    stage: str   # "intake" | "desirability" | "viability" | "feasibility" | "confirm_downstream" | "completed"
-    score: Optional[float] = None
-    analysis: Optional[str] = None
+    status: str  # "running" | "awaiting_review" | "completed"
+    stage: str   # "confirm_downstream" | "completed"
+    desirability_score: Optional[float] = None
+    desirability_analysis: Optional[str] = None
+    viability_score: Optional[float] = None
+    viability_analysis: Optional[str] = None
+    feasibility_score: Optional[float] = None
+    feasibility_analysis: Optional[str] = None
     overall_score: Optional[float] = None
     final_report: Optional[str] = None
     recommendation: Optional[str] = None
-    message: Optional[str] = None  # copy for the frontend to display as-is (intake questions, confirm_downstream prompt, etc.)
+    message: Optional[str] = None  # only set for confirm_downstream, copy for the frontend to display as-is
 
 
 # --- Helpers ---
@@ -224,57 +179,40 @@ def _response_from_snapshot(thread_id: str, snapshot) -> EvaluationResponse:
     """Build the API response from wherever the graph currently is.
 
     `snapshot.next` is LangGraph's own record of which node(s) will run next.
-    An empty tuple means the run reached END -- there's nothing more
-    authoritative to check than that, so we use it directly rather than
-    inferring completion from which fields happen to be populated.
+    In this graph that's only ever non-empty if the run is paused at
+    confirm_downstream (which only happens mid-/revise) -- otherwise the run
+    has either not been started, or has already reached END.
     """
     values = snapshot.values
     startup_idea = values.get("startup_idea", "")
 
-    if snapshot.next:
-        current_node = snapshot.next[0]
-        stage = NODE_TO_STAGE.get(current_node, current_node)
+    base_fields = dict(
+        thread_id=thread_id,
+        startup_idea=startup_idea,
+        desirability_score=values.get("desirability_score"),
+        desirability_analysis=values.get("desirability_analysis"),
+        viability_score=values.get("viability_score"),
+        viability_analysis=values.get("viability_analysis"),
+        feasibility_score=values.get("feasibility_score"),
+        feasibility_analysis=values.get("feasibility_analysis"),
+    )
 
-        if stage == "intake":
-            intake_stage = values.get("_intake_stage", "desirability")
-            history = (values.get("intake_history") or {}).get(intake_stage) or []
-            last_message = history[-1]["content"] if history else "Let's get started."
-            return EvaluationResponse(
-                thread_id=thread_id,
-                startup_idea=startup_idea,
-                status="awaiting_response",
-                stage="intake",
-                message=last_message,
-            )
-
-        if stage == "confirm_downstream":
-            source = values.get("_confirm_source", "an earlier stage")
-            next_label = "viability and feasibility" if source == "desirability" else "feasibility"
-            return EvaluationResponse(
-                thread_id=thread_id,
-                startup_idea=startup_idea,
-                status="awaiting_review",
-                stage="confirm_downstream",
-                message=(
-                    f"You revised {source}. {next_label.capitalize()} still "
-                    f"{'has' if next_label == 'feasibility' else 'have'} results from before — "
-                    f"re-evaluate {next_label} too, or keep the existing scores?"
-                ),
-            )
-
-        analysis_field, score_field = STAGE_ANALYSIS_FIELDS.get(stage, (None, None))
+    if snapshot.next and snapshot.next[0] == "confirm_downstream":
+        source = values.get("_confirm_source", "an earlier stage")
+        next_label = "viability and feasibility" if source == "desirability" else "feasibility"
         return EvaluationResponse(
-            thread_id=thread_id,
-            startup_idea=startup_idea,
+            **base_fields,
             status="awaiting_review",
-            stage=stage,
-            score=values.get(score_field) if score_field else None,
-            analysis=values.get(analysis_field) if analysis_field else None,
+            stage="confirm_downstream",
+            message=(
+                f"You revised {source}. {next_label.capitalize()} still "
+                f"{'has' if next_label == 'feasibility' else 'have'} results from before — "
+                f"re-evaluate {next_label} too, or keep the existing scores?"
+            ),
         )
 
     return EvaluationResponse(
-        thread_id=thread_id,
-        startup_idea=startup_idea,
+        **base_fields,
         status="completed",
         stage="completed",
         overall_score=values.get("overall_score"),
@@ -293,9 +231,11 @@ def health():
 
 @app.post("/evaluate/start", response_model=EvaluationResponse)
 def start_evaluation(payload: StartRequest):
-    """Kick off an evaluation. Runs to the first checkpoint, which is now
-    always the desirability intake question rather than the full analysis --
-    the agent asks a couple of clarifying questions before it starts scoring.
+    """Run the full evaluation pipeline in one shot: desirability ->
+    viability -> feasibility -> report. Each stage node does its own web
+    research to ground its assumptions, so this call can take a while
+    (multiple LLM calls and searches per stage) -- the response only comes
+    back once the whole pipeline has finished.
     """
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
@@ -303,12 +243,12 @@ def start_evaluation(payload: StartRequest):
         payload.startup_idea, payload.idea_description, payload.funding_model, payload.arr_target
     )
 
-    logger.info(f"[{thread_id}] Starting evaluation for: {payload.startup_idea}")
+    logger.info(f"[{thread_id}] Starting full evaluation for: {payload.startup_idea}")
     try:
         graph.invoke(initial_state, config=config)
     except Exception as e:
-        logger.error(f"[{thread_id}] Error starting evaluation: {e}")
-        raise HTTPException(status_code=500, detail=f"Error starting evaluation: {e}")
+        logger.error(f"[{thread_id}] Error during evaluation: {e}")
+        raise HTTPException(status_code=500, detail=f"Error during evaluation: {e}")
 
     snapshot = graph.get_state(config)
     return _response_from_snapshot(thread_id, snapshot)
@@ -316,135 +256,18 @@ def start_evaluation(payload: StartRequest):
 
 @app.get("/evaluate/{thread_id}", response_model=EvaluationResponse)
 def get_evaluation(thread_id: str):
-    """Re-fetch the current checkpoint for an in-progress or completed evaluation."""
+    """Re-fetch a completed (or, rarely, mid-revise) evaluation."""
     _, snapshot = _get_snapshot_or_404(thread_id)
     return _response_from_snapshot(thread_id, snapshot)
-
-
-@app.post("/evaluate/{thread_id}/respond", response_model=EvaluationResponse)
-def respond_to_intake(thread_id: str, payload: RespondRequest):
-    """Answer an intake question. Either another question comes back, or the
-    graph moves on to that stage's full analysis once the agent has enough.
-    """
-    config, snapshot = _get_snapshot_or_404(thread_id)
-
-    if not snapshot.next or snapshot.next[0] != "await_intake_response":
-        raise HTTPException(status_code=400, detail="No pending intake question for this evaluation.")
-
-    stage = snapshot.values.get("_intake_stage", "desirability")
-    intake_history = snapshot.values.get("intake_history") or {}
-    history = intake_history.get(stage) or []
-    conv_history = snapshot.values.get("conversation_history") or []
-
-    intake_history[stage] = history + [{"role": "human", "content": payload.answer}]
-    graph.update_state(config, {
-        "intake_history": intake_history,
-        "conversation_history": conv_history + [{"role": "human", "content": payload.answer}],
-    })
-
-    logger.info(f"[{thread_id}] Intake response recorded for {stage}, resuming...")
-    try:
-        graph.invoke(None, config=config)
-    except Exception as e:
-        logger.error(f"[{thread_id}] Error resuming after intake response: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    snapshot = graph.get_state(config)
-    return _response_from_snapshot(thread_id, snapshot)
-
-
-@app.post("/evaluate/{thread_id}/feedback", response_model=EvaluationResponse)
-def submit_feedback(thread_id: str, payload: FeedbackRequest):
-    """Submit human feedback for whichever stage is currently paused, then resume the graph."""
-    config, snapshot = _get_snapshot_or_404(thread_id)
-
-    if not snapshot.next:
-        raise HTTPException(
-            status_code=400,
-            detail="This evaluation has already completed; there is no pending checkpoint to review.",
-        )
-
-    current_node = snapshot.next[0]
-    stage = NODE_TO_STAGE.get(current_node)
-    if stage is None or stage not in STAGE_FEEDBACK_FIELDS:
-        raise HTTPException(status_code=409, detail=f"Evaluation is paused at an unexpected node '{current_node}'")
-
-    feedback_field = STAGE_FEEDBACK_FIELDS[stage]
-    graph.update_state(config, {feedback_field: payload.feedback})
-
-    logger.info(f"[{thread_id}] Feedback recorded for {stage}, resuming...")
-    try:
-        graph.invoke(None, config=config)
-    except Exception as e:
-        logger.error(f"[{thread_id}] Error resuming evaluation: {e}")
-        raise HTTPException(status_code=500, detail=f"Error resuming evaluation: {e}")
-
-    snapshot = graph.get_state(config)
-    return _response_from_snapshot(thread_id, snapshot)
-
-
-@app.post("/evaluate/{thread_id}/discuss", response_model=AskResponse)
-def discuss_current_stage(thread_id: str, payload: DiscussRequest):
-    """Ask about whatever stage the evaluation is currently paused at,
-    WITHOUT advancing the graph. The founder can go back and forth here as
-    many times as they like; nothing moves forward until they separately
-    call /feedback (or /confirm-downstream, or /respond for intake).
-    """
-    config, snapshot = _get_snapshot_or_404(thread_id)
-
-    if not snapshot.next:
-        raise HTTPException(status_code=400, detail="Evaluation has completed -- use /ask instead of /discuss.")
-
-    current_node = snapshot.next[0]
-    stage = NODE_TO_STAGE.get(current_node)
-    analysis_field, _ = STAGE_ANALYSIS_FIELDS.get(stage, (None, None))
-    if not analysis_field:
-        raise HTTPException(status_code=400, detail=f"Nothing to discuss at stage '{stage}' yet.")
-
-    # Founder can trigger a live web lookup just by asking something that
-    # needs current info (e.g. "what's Prodigy's pricing right now?") --
-    # maybe_search decides on its own whether this question warrants it.
-    used_search, search_context = maybe_search(payload.question)
-
-    values = snapshot.values
-    llm = ChatGroq(api_key=Config.GROQ_API_KEY, model=Config.GROQ_MODEL, temperature=0.5)
-    prompt = ChatPromptTemplate.from_template("""
-    You're a startup advisor. The founder just read your {stage} analysis
-    below and has a follow-up question. Answer directly and conversationally
-    -- a few sentences, not a re-statement of the whole analysis.
-
-    {stage} analysis:
-    {analysis}
-
-    {search_note}
-
-    Founder's question: {question}
-    """)
-    chain = prompt | llm
-
-    try:
-        response = chain.invoke({
-            "stage": stage,
-            "analysis": values.get(analysis_field) or "Not available",
-            "search_note": f"Recent web search results relevant to this question:\n{search_context}" if used_search else "",
-            "question": payload.question,
-        })
-    except Exception as e:
-        logger.error(f"[{thread_id}] Error in discussion: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    answer = response.content
-    if used_search:
-        answer += "\n\n_(I looked this up just now to answer that.)_"
-
-    return AskResponse(thread_id=thread_id, question=payload.question, answer=answer)
 
 
 @app.post("/evaluate/{thread_id}/confirm-downstream", response_model=EvaluationResponse)
 def confirm_downstream_choice(thread_id: str, payload: ConfirmDownstreamRequest):
     """Answer the 'do you want to re-evaluate viability/feasibility too?'
     checkpoint that appears after revising an earlier stage while later
-    stages still hold results from a prior run.
+    stages still hold results from a prior run. This is the only endpoint
+    in the whole API that resumes a mid-flight graph -- every other
+    interaction happens on a completed evaluation.
     """
     config, snapshot = _get_snapshot_or_404(thread_id)
 
@@ -467,11 +290,10 @@ def confirm_downstream_choice(thread_id: str, payload: ConfirmDownstreamRequest)
 
 @app.post("/evaluate/{thread_id}/revise", response_model=EvaluationResponse)
 def revise_evaluation(thread_id: str, payload: ReviseRequest):
-    """Rewind a completed evaluation back to a given stage and re-run from
-    there (through that stage's intake first), keeping the same thread_id so
-    earlier/later stages' analysis and scores aren't lost. If later stages
-    still hold results from before, the graph pauses at confirm_downstream
-    to ask whether to redo those too.
+    """Rewind a completed evaluation back to a given stage and re-run it,
+    keeping the same thread_id so the other stages' results aren't lost. If
+    later stages still hold results from before, the graph pauses at
+    confirm_downstream to ask whether to redo those too.
     """
     config, snapshot = _get_snapshot_or_404(thread_id)
 
@@ -481,8 +303,8 @@ def revise_evaluation(thread_id: str, payload: ReviseRequest):
     if snapshot.next:
         raise HTTPException(
             status_code=400,
-            detail="Evaluation is still in progress; revising only applies once it has a result "
-                   "for the target stage. Submit feedback to advance it, or wait for completion.",
+            detail="Evaluation is paused on a pending downstream confirmation; resolve that first "
+                   "via /confirm-downstream before revising.",
         )
 
     missing = [f for f in STAGE_PREREQUISITES[payload.stage] if snapshot.values.get(f) is None]
@@ -494,11 +316,6 @@ def revise_evaluation(thread_id: str, payload: ReviseRequest):
         )
 
     values_to_clear = {field: None for field in STAGE_FIELDS_TO_CLEAR[payload.stage]}
-    values_to_clear["_intake_stage"] = payload.stage
-    values_to_clear["intake_ready"] = False
-    existing_intake_history = snapshot.values.get("intake_history") or {}
-    existing_intake_history[payload.stage] = []
-    values_to_clear["intake_history"] = existing_intake_history
     if payload.idea_description:
         values_to_clear["idea_description"] = payload.idea_description
 
@@ -518,11 +335,11 @@ def revise_evaluation(thread_id: str, payload: ReviseRequest):
 
 
 _ASK_PROMPT = ChatPromptTemplate.from_template("""
-You are answering a founder's follow-up question about a startup evaluation
-that has already been completed. Use only the information below -- don't
-invent scores, facts, or analysis that isn't here. If the question asks
-about something the evaluation didn't cover, say so plainly rather than
-guessing.
+You are answering a founder's question about a startup evaluation that has
+already been completed. Use the information below as your primary source --
+don't invent scores, facts, or analysis that isn't here. If fresh web
+search results are provided below, prioritize the most current information
+in your answer and say so.
 
 Startup Idea: {startup_idea}
 Idea Description: {idea_description}
@@ -542,6 +359,8 @@ Recommendation: {recommendation}
 Final Report:
 {final_report}
 
+{search_note}
+
 Founder's question: {question}
 
 Answer directly and concretely. Keep it focused -- a few sentences to a
@@ -551,24 +370,25 @@ short paragraph, not a restatement of the whole report.
 
 @app.post("/evaluate/{thread_id}/ask", response_model=AskResponse)
 def ask_followup(thread_id: str, payload: AskRequest):
-    """Answer a founder's follow-up question about a completed evaluation.
+    """Answer a founder's question about a completed evaluation.
 
-    Stateless with respect to the graph -- this doesn't touch the LangGraph
-    checkpoint at all, it just reads the finished state as context for a
-    direct LLM call. Only works once the evaluation has actually completed.
-    Use /discuss instead for questions about a stage that's still paused
-    mid-evaluation.
+    If the question needs current, real-world information the evaluation
+    doesn't already have (e.g. "what's Competitor X charging right now?"),
+    this automatically runs a live web search and folds the results into
+    the answer -- see src/utils/smart_search.py for how that decision gets
+    made. Otherwise it just answers from the evaluation's own analysis.
     """
     _, snapshot = _get_snapshot_or_404(thread_id)
 
     if snapshot.next:
         raise HTTPException(
             status_code=400,
-            detail="This evaluation is still in progress. Use /discuss for questions about the "
-                   "currently-paused stage, or wait for the evaluation to complete.",
+            detail="Evaluation has a pending downstream confirmation; resolve that first via /confirm-downstream.",
         )
 
     values = snapshot.values
+    used_search, search_context = maybe_search(payload.question)
+
     llm = ChatGroq(api_key=Config.GROQ_API_KEY, model=Config.GROQ_MODEL, temperature=0.5)
     chain = _ASK_PROMPT | llm
 
@@ -586,10 +406,15 @@ def ask_followup(thread_id: str, payload: AskRequest):
             "overall_score": values.get("overall_score", 0),
             "recommendation": values.get("recommendation", ""),
             "final_report": values.get("final_report", ""),
+            "search_note": f"Recent web search results relevant to this question:\n{search_context}" if used_search else "",
             "question": payload.question,
         })
     except Exception as e:
         logger.error(f"[{thread_id}] Error answering follow-up: {e}")
         raise HTTPException(status_code=500, detail=f"Error answering follow-up: {e}")
 
-    return AskResponse(thread_id=thread_id, question=payload.question, answer=response.content)
+    answer = response.content
+    if used_search:
+        answer += "\n\n_(I looked this up just now to answer that.)_"
+
+    return AskResponse(thread_id=thread_id, question=payload.question, answer=answer)

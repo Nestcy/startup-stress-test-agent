@@ -43,7 +43,11 @@ class FeasibilityAnalyzer:
         4. Technical Risks and scalability
         5. Team Requirements and hiring timeline
         
-        Format as JSON with keys: core_components, tech_stack, mvp_scope, technical_risks, team_requirements
+        Format as JSON with keys: core_components, tech_stack, mvp_scope, technical_risks,
+        team_requirements, sourced_claims, assumptions
+        "sourced_claims": specific facts above drawn directly from the tech research provided.
+        "assumptions": specific facts above that are your own estimate (e.g. team hiring
+        timeline), not confirmed by the research.
         """)
 
         chain = prompt | self.llm
@@ -53,7 +57,7 @@ class FeasibilityAnalyzer:
 
         tech_requirements = extract_json(
             response.content,
-            fallback_keys=("core_components", "tech_stack", "mvp_scope", "technical_risks", "team_requirements"),
+            fallback_keys=("core_components", "tech_stack", "mvp_scope", "technical_risks", "team_requirements", "sourced_claims", "assumptions"),
         )
 
         logger.info("Technical requirements researched")
@@ -222,6 +226,9 @@ class FeasibilityAnalyzer:
         return assessment
 
 
+from src.nodes.desirability_node import _collect_provenance
+
+
 def feasibility_node(state: StartupStressTestState) -> StartupStressTestState:
     """Comprehensive feasibility evaluation node."""
     logger.info(f"Starting feasibility evaluation for: {state['startup_idea']}")
@@ -232,6 +239,23 @@ def feasibility_node(state: StartupStressTestState) -> StartupStressTestState:
     traction_roadmap = analyzer.build_traction_roadmap(state['startup_idea'], state.get('viability_analysis', ''))
     rollout_plan = analyzer.create_now_next_later_plan(state['startup_idea'])
     feasibility_assessment = analyzer.generate_feasibility_assessment(tech_requirements, traction_roadmap, rollout_plan)
+
+    provenance = []
+    provenance += _collect_provenance("feasibility", "technical_requirements", tech_requirements)
+    # The traction roadmap and NOW/NEXT/LATER phases are built from generic
+    # SaaS growth benchmarks baked into the prompt template (e.g. "MRR
+    # growth 20-30%"), not searched or specific to this idea -- flag them
+    # as assumptions outright rather than treating them as researched.
+    provenance.append({
+        "stage": "feasibility", "phase": "traction_roadmap", "type": "assumption",
+        "claim": "10x growth milestones and metric targets are generic SaaS benchmarks, not specific to this idea or market.",
+    })
+    provenance.append({
+        "stage": "feasibility", "phase": "rollout_plan", "type": "assumption",
+        "claim": "NOW/NEXT/LATER timeline and gate thresholds are generic startup benchmarks, not specific to this idea or market.",
+    })
+    for claim in (feasibility_assessment.get("assumptions") or []):
+        provenance.append({"stage": "feasibility", "phase": "scoring", "type": "assumption", "claim": claim})
 
     analysis_report = f"""
     ============================================
@@ -255,6 +279,8 @@ def feasibility_node(state: StartupStressTestState) -> StartupStressTestState:
     state['feasibility_analysis'] = analysis_report
     state['feasibility_status'] = EvaluationStatus.COMPLETED
     state['feasibility_score'] = feasibility_assessment.get('overall_score', 0)
+    existing_provenance = [a for a in (state.get('all_assumptions') or []) if a.get('stage') != 'feasibility']
+    state['all_assumptions'] = existing_provenance + provenance
 
     logger.info(f"Feasibility evaluation completed. Score: {state['feasibility_score']}")
     return state

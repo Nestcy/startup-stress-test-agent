@@ -1,56 +1,39 @@
 # Startup Stress Test AI Agent
 
-An AI agent that helps founders pressure-test a startup idea before they spend months building it. It asks three questions, in order, and won't let you skip ahead until each one has a real answer:
+An AI agent that helps founders pressure-test a startup idea before they spend months building it. Give it an idea and a description, and it runs straight through three questions, gathering real data along the way to ground its answers rather than guessing:
 
-1. **Do people actually want this?**
-2. **Does the math work as a business?**
-3. **Can we actually build and execute it?**
+1. **Do people actually want this?** (Desirability)
+2. **Does the math work as a business?** (Viability)
+3. **Can we actually build and execute it?** (Feasibility)
 
-Built with LangChain + LangGraph, running on Groq, with live web research via Tavily and a human checkpoint after every stage — the agent proposes an analysis, you react to it, and only then does it move forward.
+The founder isn't interrupted mid-run. Once the full report is ready, that's when they step in — reading it, asking questions, and revising whichever stage needs another pass.
 
-## The Three Questions
+## How It Works
 
-### 🎯 Do people want this? (Desirability)
+**1. You give it an idea.** Just a name and a description — no back-and-forth required to get started.
 
-Before anything else, the agent digs into who you're building for and whether the problem is real enough that people will actually switch to your solution.
+**2. It runs the full pipeline in one go.** Each stage does its own web research (via Tavily) to find real market data, competitor pricing, churn benchmarks, and technical references — so its scoring is grounded in something, not just the model's assumptions about your idea. This takes a few minutes since it's several search + LLM calls per stage.
 
-- Who the customer actually is, and how they'd be segmented
-- What's changed recently that makes now the moment (market shifts, new triggers)
-- What people currently do instead of your solution, and how good those alternatives already are
-- Whether your solution actually fits the problem, not just sounds like it does
-- A desirability score out of 100, purely as a signal — not a verdict
+**3. You get a complete report.** Desirability, viability, and feasibility scores, a full analysis for each, and an overall GO / CONDITIONAL / NO-GO recommendation.
 
-### 💰 Does the math work? (Viability)
-
-Assuming people want it, can it survive as a business? This stage runs the actual numbers.
-
-- Market size (how many people could realistically buy this)
-- Bootstrap vs. VC-backed — which funding path fits, and what ARR target you're aiming for
-- Pricing and what a healthy customer relationship looks like financially
-- Churn and customer lifetime, based on real industry benchmarks
-- A full breakdown of how customers actually get acquired — leads → activation → paying customer — with CAC, LTV, and payback period
-- A viability score out of 100
-
-### ⚙️ Can we build it? (Feasibility)
-
-Assuming the idea is wanted and the math works, is it actually executable?
-
-- What it would take technically — architecture, MVP scope
-- A realistic growth roadmap at 3, 12, 24, and 36 months
-- A NOW / NEXT / LATER plan: what to prove first, what to build next, what to scale later
-- A feasibility score out of 100
+**4. Now you're in control.** From here:
+- **Ask questions** — "why is my viability score low?", "what's Competitor X charging right now?" (this can trigger a live search automatically if the question needs current info)
+- **Revise a stage** — change your idea description and re-run desirability, viability, or feasibility specifically, without losing the other stages' results
 
 ## Why It's Built This Way
 
-Early on, this agent used to kill an evaluation automatically if a score came back too low — e.g. exit immediately if desirability scored under 30. That's been removed. A low score on an unvalidated, early-stage idea usually means "we don't have enough real information yet," not "this idea is bad" — and you can't score an assumption as if it were a fact. The agent now walks through all three questions regardless of score, and only stops early if *you* decide to stop.
+An earlier version of this agent used to kill an evaluation automatically if a score came back too low, and paused for approval after every single stage. Both of those got removed:
+
+- **No more auto-kill on low scores.** A low score on an unvalidated, early-stage idea usually means "we don't have enough real information yet," not "this idea is bad" — you can't score an assumption as if it were a fact. The agent runs all three stages regardless of score.
+- **No more pausing mid-run.** Approving three separate checkpoints before seeing a finished result added friction without adding much value — the founder's actual judgment matters most once they can see the whole picture, not one incomplete piece at a time.
 
 ## Revising a Stage
 
-Ideas change as you learn more. You can go back and redo any one of the three stages — say, change your idea description and re-run the desirability analysis — without losing the work you already did on the other two. If a stage you're revising has later stages that already have results (e.g. you revise desirability after viability and feasibility are done), the agent asks whether you want to redo those too, or keep them as-is. Nothing is silently overwritten or silently kept — you decide.
+You can go back and redo any one of the three stages — say, change your idea description and re-run desirability — without losing the work already done on the other two. If the stage you're revising has later stages that already have results (e.g. you revise desirability after viability and feasibility are done), the agent asks whether you want to redo those too, or keep them as-is. Nothing is silently overwritten or silently kept — you decide.
 
-## Ask Follow-Up Questions
+## Ask Questions, With Live Search When Needed
 
-Once an evaluation is complete, you can ask the agent direct questions about the result — "why is my viability score low?", "what's the biggest risk here?" — and it answers using the actual analysis it produced, not a fresh guess. This is separate from revising: asking a question doesn't change any scores or analysis, it just helps you understand what's already there. If the answer makes you want to actually change something, that's what revising a stage is for.
+Once an evaluation is complete, you can ask the agent anything about it. If your question needs information the evaluation doesn't already have — current pricing, a specific competitor, recent news — it automatically runs a fresh web search before answering, rather than guessing or refusing. If it doesn't need that, it just answers from the evaluation's own analysis.
 
 ## Project Structure
 
@@ -58,27 +41,29 @@ Once an evaluation is complete, you can ask the agent direct questions about the
 startup-stress-test-agent/
 ├── src/
 │   ├── __init__.py
-│   ├── state.py                 # State schema and types
-│   ├── graph.py                 # LangGraph orchestration with human-driven routing
-│   ├── api.py                   # HTTP API (FastAPI) — used by the Lovable frontend
+│   ├── state.py                  # State schema and types
+│   ├── graph.py                  # Straight-through pipeline + revision routing
+│   ├── api.py                    # HTTP API (FastAPI) — used by the Lovable frontend
 │   ├── nodes/
 │   │   ├── __init__.py
-│   │   ├── desirability_node.py # Do people want this?
-│   │   ├── viability_node.py    # Does the math work?
-│   │   ├── feasibility_node.py  # Can we build it?
-│   │   ├── human_review_node.py # Checkpoint + revision-confirmation interactions
-│   │   └── report_node.py       # Final report generation
+│   │   ├── desirability_node.py  # Do people want this? (with web research)
+│   │   ├── viability_node.py     # Does the math work? (with web research)
+│   │   ├── feasibility_node.py   # Can we build it? (with web research)
+│   │   ├── revision_node.py      # The one interrupt point, used only during /revise
+│   │   └── report_node.py        # Final report generation
 │   ├── tools/
 │   │   ├── __init__.py
-│   │   └── search_tool.py       # Tavily search wrapper
+│   │   └── search_tool.py        # Tavily search wrapper
 │   └── utils/
 │       ├── __init__.py
-│       ├── config.py            # Configuration management
-│       └── logger.py            # Logging setup
+│       ├── config.py             # Configuration management
+│       ├── logger.py             # Logging setup
+│       ├── llm_json.py           # Safely extracts JSON from reasoning-model output
+│       └── smart_search.py       # Decides whether a founder's question needs a live search
 ├── requirements.txt
 ├── .env.example
-├── Procfile                      # Railway deployment entry point
-├── main.py                       # CLI entry point
+├── Procfile                       # Railway deployment entry point
+├── main.py                        # CLI entry point
 └── README.md
 ```
 
@@ -122,7 +107,7 @@ GROQ_MODEL=qwen/qwen3.6-27b
 DATABASE_URL=your_postgres_connection_string   # optional but recommended for the API — see below
 ```
 
-`DATABASE_URL` is optional for local CLI use. If you're running the API (`src/api.py`) — which is what the Lovable frontend talks to — set this, or every in-progress evaluation is lost the moment the server restarts. On Railway, attaching a Postgres addon sets this automatically.
+`DATABASE_URL` is optional for local CLI use. If you're running the API (`src/api.py`) — which is what the Lovable frontend talks to — set this, or a completed evaluation is lost the moment the server restarts, which breaks `/ask` and `/revise` for anything started before that restart. On Railway, attaching a Postgres addon sets this automatically.
 
 ## Usage
 
@@ -132,7 +117,7 @@ DATABASE_URL=your_postgres_connection_string   # optional but recommended for th
 python main.py
 ```
 
-You'll be prompted to describe your idea and walk through each stage interactively in the terminal.
+Runs the full evaluation straight through, prints the report, then offers a small menu to ask questions or revise a stage.
 
 ### API (for the Lovable frontend, or any web client)
 
@@ -144,12 +129,13 @@ Key endpoints:
 
 | Endpoint | What it does |
 |---|---|
-| `POST /evaluate/start` | Start a new evaluation |
-| `POST /evaluate/{id}/feedback` | Submit feedback at the current checkpoint and move to the next stage |
+| `POST /evaluate/start` | Runs the full pipeline (desirability → viability → feasibility → report) and returns the finished result |
+| `GET /evaluate/{id}` | Re-fetch a completed evaluation |
+| `POST /evaluate/{id}/ask` | Ask a question about a completed evaluation (auto-searches if needed) |
 | `POST /evaluate/{id}/revise` | Redo a specific stage (`desirability`, `viability`, or `feasibility`) |
 | `POST /evaluate/{id}/confirm-downstream` | Answer whether to also redo later stages after a revise |
-| `POST /evaluate/{id}/ask` | Ask a question about a completed evaluation |
-| `GET /evaluate/{id}` | Check the current state of an evaluation |
+
+Note: `POST /evaluate/start` doesn't return until the whole pipeline finishes — expect it to take a few minutes given the number of search + LLM calls involved. Design your frontend's loading state accordingly.
 
 ## Key Financial Formulas
 
@@ -189,7 +175,7 @@ Target: > 3:1 (healthy), > 4:1 (excellent)
 
 Areas for enhancement:
 
-- Persistent conversation history for `/ask` (currently stateless per question)
+- Streaming progress updates during the pipeline run (so the frontend can show "researching viability..." rather than a blank wait)
 - Export to PDF/docs
 - Benchmark comparisons across evaluations
 - Historical tracking of revisions over time

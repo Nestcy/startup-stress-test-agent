@@ -25,14 +25,25 @@ class DesirabilityAnalyzer:
         self.search_tool = SearchTool()
 
     def identify_customer_segment(self, startup_idea: str, idea_description: str) -> Dict:
-        """Phase 1: Identify who the primary customer is"""
+        """Phase 1: Identify who the primary customer is.
+
+        Previously this phase had no search grounding at all -- TAM, pain
+        level, and willingness-to-pay were pure LLM guesses. Now it searches
+        for real market-size/spending data first, and the prompt requires
+        the model to say which parts of its answer are backed by that
+        search versus which are still its own estimate.
+        """
         logger.info("Phase 1: Identifying customer segment...")
+
+        search_query = f"{startup_idea} target customer market size spending willingness to pay"
+        market_data = self.search_tool.search(search_query, topic="general")
 
         prompt = ChatPromptTemplate.from_template("""
         Based on this startup idea, identify the primary customer segment.
         
         Startup Idea: {startup_idea}
         Description: {description}
+        Market Research: {market_data}
         
         Analyze and provide:
         1. Primary Customer Segment: Who are the main users?
@@ -41,18 +52,28 @@ class DesirabilityAnalyzer:
         4. Customer Pain Level: How acute is their pain?
         5. Customer Willingness to Pay: Budget/spending capacity
         
-        Format as JSON with keys: segment, profile, tam, pain_level, willingness_to_pay
+        Use the market research above wherever it's relevant -- don't ignore it in
+        favor of a guess. Where the research doesn't cover something, say so plainly
+        rather than presenting a guess as if it were confirmed.
+        
+        Format as JSON with keys: segment, profile, tam, pain_level, willingness_to_pay,
+        sourced_claims, assumptions
+        "sourced_claims": short list of specific facts/numbers above that came from the
+        market research, not your own estimate.
+        "assumptions": short list of specific facts/numbers above that are your own
+        estimate, not confirmed by the research (e.g. no search data existed on this).
         """)
 
         chain = prompt | self.llm
         response = chain.invoke({
             "startup_idea": startup_idea,
-            "description": idea_description
+            "description": idea_description,
+            "market_data": str(market_data[:3]) if market_data else "No market data found"
         })
 
         customer_data = extract_json(
             response.content,
-            fallback_keys=("segment", "profile", "tam", "pain_level", "willingness_to_pay"),
+            fallback_keys=("segment", "profile", "tam", "pain_level", "willingness_to_pay", "sourced_claims", "assumptions"),
         )
 
         logger.info(f"Customer segment identified: {customer_data.get('segment', 'Unknown')}")
@@ -78,7 +99,11 @@ class DesirabilityAnalyzer:
         3. Secondary Switching Triggers: What else could accelerate adoption?
         4. Urgency Timeline: How urgent is this shift?
         
-        Format as JSON with keys: major_shifts, primary_trigger, secondary_triggers, urgency_timeline
+        Format as JSON with keys: major_shifts, primary_trigger, secondary_triggers,
+        urgency_timeline, sourced_claims, assumptions
+        "sourced_claims": specific facts above drawn directly from the market data provided.
+        "assumptions": specific facts above that are your own inference, not directly
+        stated in the market data (e.g. "no data existed on X, so I inferred Y").
         """)
 
         chain = prompt | self.llm
@@ -90,7 +115,7 @@ class DesirabilityAnalyzer:
 
         shifts_data = extract_json(
             response.content,
-            fallback_keys=("major_shifts", "primary_trigger", "secondary_triggers", "urgency_timeline"),
+            fallback_keys=("major_shifts", "primary_trigger", "secondary_triggers", "urgency_timeline", "sourced_claims", "assumptions"),
         )
 
         logger.info("Market shifts and switching triggers identified")
@@ -117,7 +142,11 @@ class DesirabilityAnalyzer:
         4. Customer Satisfaction with Alternatives
         5. Switching Costs
         
-        Format as JSON with keys: direct_competitors, indirect_competitors, status_quo, satisfaction, switching_costs
+        Format as JSON with keys: direct_competitors, indirect_competitors, status_quo,
+        satisfaction, switching_costs, sourced_claims, assumptions
+        "sourced_claims": specific facts above drawn directly from the market research provided.
+        "assumptions": specific facts above (e.g. status_quo percentage) that are your own
+        estimate because the research didn't cover it directly.
         """)
 
         chain = prompt | self.llm
@@ -129,7 +158,7 @@ class DesirabilityAnalyzer:
 
         alternatives_data = extract_json(
             response.content,
-            fallback_keys=("direct_competitors", "indirect_competitors", "status_quo", "satisfaction", "switching_costs"),
+            fallback_keys=("direct_competitors", "indirect_competitors", "status_quo", "satisfaction", "switching_costs", "sourced_claims", "assumptions"),
         )
 
         logger.info("Existing alternatives documented")
@@ -137,8 +166,27 @@ class DesirabilityAnalyzer:
 
     def analyze_solution_fit(self, startup_idea: str, idea_description: str,
                             customer_segment: str, alternatives_data: Dict) -> Dict:
-        """Phase 4: Founder's identified problems and proposed solution"""
+        """Phase 4: Founder's identified problems and proposed solution.
+
+        Previously this phase had no search of its own -- competitor
+        comparison and uniqueness claims came straight from the model's
+        training data, which can be stale or simply wrong about a
+        competitor's current features/pricing. Now it searches using the
+        actual competitor names surfaced in Phase 3, if any were found.
+        """
         logger.info("Phase 4: Analyzing solution-problem fit...")
+
+        competitor_names = []
+        for c in (alternatives_data.get("direct_competitors") or [])[:3]:
+            name = c.get("name") if isinstance(c, dict) else c
+            if name:
+                competitor_names.append(str(name))
+
+        if competitor_names:
+            search_query = f"{startup_idea} vs {' vs '.join(competitor_names)} comparison differentiation"
+        else:
+            search_query = f"{startup_idea} competitors differentiation unique value proposition"
+        competitor_data = self.search_tool.search(search_query, topic="general")
 
         prompt = ChatPromptTemplate.from_template("""
         Analyze the startup's solution against identified customer problems.
@@ -146,6 +194,7 @@ class DesirabilityAnalyzer:
         Startup Idea: {startup_idea}
         Solution Description: {description}
         Target Customer: {customer_segment}
+        Competitor Research: {competitor_data}
         
         Evaluate:
         1. Problem Validation: Are these real problems?
@@ -154,19 +203,28 @@ class DesirabilityAnalyzer:
         4. Adoption Advantage: Why would customers switch?
         5. Desirability Risk Assessment
         
-        Format as JSON with keys: problem_validation, uniqueness, solution_fit, adoption_advantage, risk_assessment
+        Ground the uniqueness and adoption-advantage claims in the competitor research
+        above wherever it's relevant, rather than relying purely on general knowledge
+        of the space, which can be outdated.
+        
+        Format as JSON with keys: problem_validation, uniqueness, solution_fit,
+        adoption_advantage, risk_assessment, sourced_claims, assumptions
+        "sourced_claims": specific claims above drawn from the competitor research provided.
+        "assumptions": specific claims above that are your own inference, not confirmed
+        by the research (e.g. no current data existed on a competitor's pricing).
         """)
 
         chain = prompt | self.llm
         response = chain.invoke({
             "startup_idea": startup_idea,
             "description": idea_description,
-            "customer_segment": customer_segment
+            "customer_segment": customer_segment,
+            "competitor_data": str(competitor_data[:3]) if competitor_data else "No competitor data found"
         })
 
         solution_fit_data = extract_json(
             response.content,
-            fallback_keys=("problem_validation", "uniqueness", "solution_fit", "adoption_advantage", "risk_assessment"),
+            fallback_keys=("problem_validation", "uniqueness", "solution_fit", "adoption_advantage", "risk_assessment", "sourced_claims", "assumptions"),
         )
 
         logger.info("Solution-problem fit analyzed")
@@ -218,6 +276,19 @@ class DesirabilityAnalyzer:
         return final_score_data
 
 
+def _collect_provenance(stage: str, phase_name: str, phase_data: Dict) -> list:
+    """Pull sourced_claims/assumptions out of a phase's JSON output into a
+    flat list of {stage, phase, type, claim} entries, so the report node can
+    build a single "what's real vs. assumed" section across all stages.
+    """
+    entries = []
+    for claim in (phase_data.get("sourced_claims") or []):
+        entries.append({"stage": stage, "phase": phase_name, "type": "sourced", "claim": claim})
+    for claim in (phase_data.get("assumptions") or []):
+        entries.append({"stage": stage, "phase": phase_name, "type": "assumption", "claim": claim})
+    return entries
+
+
 def desirability_node(state: StartupStressTestState) -> StartupStressTestState:
     """Comprehensive desirability evaluation node."""
     logger.info(f"Starting desirability evaluation for: {state['startup_idea']}")
@@ -230,6 +301,14 @@ def desirability_node(state: StartupStressTestState) -> StartupStressTestState:
     alternatives_data = analyzer.research_existing_alternatives(state['startup_idea'], customer_segment)
     solution_fit_data = analyzer.analyze_solution_fit(state['startup_idea'], state.get('idea_description', ''), customer_segment, alternatives_data)
     final_analysis = analyzer.generate_desirability_score(customer_data, shifts_data, alternatives_data, solution_fit_data)
+
+    provenance = []
+    provenance += _collect_provenance("desirability", "customer_identification", customer_data)
+    provenance += _collect_provenance("desirability", "market_shifts", shifts_data)
+    provenance += _collect_provenance("desirability", "existing_alternatives", alternatives_data)
+    provenance += _collect_provenance("desirability", "solution_fit", solution_fit_data)
+    for claim in (final_analysis.get("assumptions") or []):
+        provenance.append({"stage": "desirability", "phase": "scoring", "type": "assumption", "claim": claim})
 
     analysis_report = f"""
     ============================================
@@ -256,6 +335,8 @@ def desirability_node(state: StartupStressTestState) -> StartupStressTestState:
     state['desirability_analysis'] = analysis_report
     state['desirability_status'] = EvaluationStatus.COMPLETED
     state['desirability_score'] = final_analysis.get('overall_score', 0)
+    existing_provenance = [a for a in (state.get('all_assumptions') or []) if a.get('stage') != 'desirability']
+    state['all_assumptions'] = existing_provenance + provenance
 
     logger.info(f"Desirability evaluation completed. Score: {state['desirability_score']}")
     return state

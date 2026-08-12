@@ -6,6 +6,38 @@ from src.utils.logger import logger
 from src.utils.config import Config
 
 
+def _build_assumptions_section(all_assumptions: list) -> str:
+    """Build a markdown section listing every claim the evaluation made,
+    split into what's backed by a live search versus what the model
+    estimated on its own -- so the founder knows exactly which numbers in
+    this report to trust and which to go verify themselves.
+    """
+    if not all_assumptions:
+        return ""
+
+    sourced = [a for a in all_assumptions if a.get("type") == "sourced"]
+    assumed = [a for a in all_assumptions if a.get("type") == "assumption"]
+
+    lines = ["\n## Data Sources & Key Assumptions\n"]
+    lines.append(
+        f"This evaluation drew on {len(sourced)} claim(s) grounded in live web research "
+        f"and {len(assumed)} claim(s) that are the model's own estimate. Treat the "
+        f"assumptions below as the first things to validate yourself.\n"
+    )
+
+    if assumed:
+        lines.append("### Assumptions to validate\n")
+        for a in assumed:
+            lines.append(f"- **[{a.get('stage', '?')} / {a.get('phase', '?')}]** {a.get('claim', '')}")
+
+    if sourced:
+        lines.append("\n### Backed by research\n")
+        for a in sourced:
+            lines.append(f"- **[{a.get('stage', '?')} / {a.get('phase', '?')}]** {a.get('claim', '')}")
+
+    return "\n".join(lines)
+
+
 def generate_final_report(state: StartupStressTestState) -> StartupStressTestState:
     """Generate comprehensive final report with all evaluations and recommendation."""
     logger.info(f"Generating final report for: {state['startup_idea']}")
@@ -56,7 +88,8 @@ def generate_final_report(state: StartupStressTestState) -> StartupStressTestSta
         "overall_score": overall_score
     })
     
-    state['final_report'] = response.content
+    assumptions_section = _build_assumptions_section(state.get('all_assumptions') or [])
+    state['final_report'] = response.content + assumptions_section
     
     if overall_score >= 70:
         state['recommendation'] = "GO - Strong potential, proceed with next phase"

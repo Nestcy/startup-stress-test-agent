@@ -46,7 +46,11 @@ class ViabilityAnalyzer:
         5. Market Growth Rate
         6. Market Maturity
         
-        Format as JSON with keys: tam, sam, total_customers_tam, total_customers_sam, distribution, growth_rate, maturity
+        Format as JSON with keys: tam, sam, total_customers_tam, total_customers_sam,
+        distribution, growth_rate, maturity, sourced_claims, assumptions
+        "sourced_claims": specific numbers above drawn directly from the market research.
+        "assumptions": specific numbers above that are your own estimate, not confirmed
+        by the research.
         """)
 
         chain = prompt | self.llm
@@ -58,7 +62,7 @@ class ViabilityAnalyzer:
 
         market_size_data = extract_json(
             response.content,
-            fallback_keys=("tam", "sam", "total_customers_tam", "total_customers_sam", "distribution", "growth_rate", "maturity"),
+            fallback_keys=("tam", "sam", "total_customers_tam", "total_customers_sam", "distribution", "growth_rate", "maturity", "sourced_claims", "assumptions"),
         )
 
         logger.info(f"Market size researched")
@@ -113,8 +117,16 @@ class ViabilityAnalyzer:
         return strategy_data
 
     def estimate_pricing_and_customers(self, startup_idea: str, strategy_data: Dict) -> Dict:
-        """Phase 3: Pricing and customer metrics. Formula: Active Customers = ARR / Yearly ACR"""
+        """Phase 3: Pricing and customer metrics. Formula: Active Customers = ARR / Yearly ACR
+
+        Previously this phase had no search grounding -- pricing was a pure
+        LLM guess. Now it searches for real comparable/competitor pricing
+        first, so the estimate has something to anchor to.
+        """
         logger.info("Phase 3: Estimating pricing and customers...")
+
+        search_query = f"{startup_idea} pricing model competitors subscription cost"
+        pricing_research = self.search_tool.search(search_query, topic="general")
 
         prompt = ChatPromptTemplate.from_template("""
         Estimate pricing and calculate required active customers.
@@ -122,6 +134,7 @@ class ViabilityAnalyzer:
         Startup Idea: {startup_idea}
         ARR Target: ${arr_target:,.0f}
         Funding: {funding_model}
+        Pricing Research: {pricing_research}
         
         Provide:
         1. Pricing Strategy (per-seat, freemium, usage-based, etc.)
@@ -129,19 +142,28 @@ class ViabilityAnalyzer:
         3. Required active customers using: Active Customers = {arr_target:,.0f} / Yearly Customer Revenue
         4. 3 scenarios: conservative, realistic, optimistic
         
-        Format as JSON with keys: pricing_model, monthly_price, yearly_acr, scenarios
+        Anchor your pricing estimate to the research above wherever it's relevant --
+        real comparable pricing beats a guess. Where the research doesn't cover a
+        comparable product, say so rather than presenting a guess as confirmed.
+        
+        Format as JSON with keys: pricing_model, monthly_price, yearly_acr, scenarios,
+        sourced_claims, assumptions
+        "sourced_claims": specific numbers above drawn directly from the pricing research.
+        "assumptions": specific numbers above that are your own estimate, not confirmed
+        by the research.
         """)
 
         chain = prompt | self.llm
         response = chain.invoke({
             "startup_idea": startup_idea,
             "arr_target": strategy_data["arr_target"],
-            "funding_model": strategy_data["funding_model"]
+            "funding_model": strategy_data["funding_model"],
+            "pricing_research": str(pricing_research[:3]) if pricing_research else "No pricing data found"
         })
 
         pricing_data = extract_json(
             response.content,
-            fallback_keys=("pricing_model", "monthly_price", "yearly_acr", "scenarios"),
+            fallback_keys=("pricing_model", "monthly_price", "yearly_acr", "scenarios", "sourced_claims", "assumptions"),
         )
 
         logger.info("Pricing estimated")
@@ -168,7 +190,11 @@ class ViabilityAnalyzer:
         5. Improvement opportunities
         6. 3 scenarios: high churn, realistic, low churn
         
-        Format as JSON with keys: benchmark_churn, customer_lifetime_months, scenarios
+        Format as JSON with keys: benchmark_churn, customer_lifetime_months, scenarios,
+        sourced_claims, assumptions
+        "sourced_claims": specific numbers above drawn directly from the churn research.
+        "assumptions": specific numbers above that are your own estimate, not confirmed
+        by the research.
         """)
 
         chain = prompt | self.llm
@@ -179,20 +205,29 @@ class ViabilityAnalyzer:
 
         churn_research = extract_json(
             response.content,
-            fallback_keys=("benchmark_churn", "customer_lifetime_months", "scenarios"),
+            fallback_keys=("benchmark_churn", "customer_lifetime_months", "scenarios", "sourced_claims", "assumptions"),
         )
 
         logger.info("Churn research completed")
         return churn_research
 
     def calculate_customer_acquisition_funnel(self, startup_idea: str, pricing_data: Dict, churn_data: Dict) -> Dict:
-        """Phase 5: Customer acquisition funnel - The Customer Factory"""
+        """Phase 5: Customer acquisition funnel - The Customer Factory.
+
+        Previously this phase had no search grounding -- CAC/LTV benchmarks
+        and conversion rates were pure LLM guesses. Now it searches for real
+        industry CAC/conversion benchmarks first.
+        """
         logger.info("Phase 5: Calculating acquisition funnel...")
+
+        search_query = f"{startup_idea} customer acquisition cost CAC conversion rate benchmark industry"
+        funnel_research = self.search_tool.search(search_query, topic="general")
 
         prompt = ChatPromptTemplate.from_template("""
         Calculate the customer acquisition funnel.
         
         Startup Idea: {startup_idea}
+        Acquisition/CAC Research: {funnel_research}
         
         Design:
         1. Acquisition Rate: User acquisition
@@ -207,19 +242,27 @@ class ViabilityAnalyzer:
         - Payback Period
         - Referral impact
         
+        Anchor CAC and conversion-rate assumptions to the research above wherever
+        it's relevant, rather than using generic industry rules of thumb by default.
+        
         Provide 3 scenarios: conservative, realistic, aggressive
         
-        Format as JSON with keys: acquisition_rate, activation_rate, revenue_rate, scenarios, referral_impact
+        Format as JSON with keys: acquisition_rate, activation_rate, revenue_rate,
+        scenarios, referral_impact, sourced_claims, assumptions
+        "sourced_claims": specific numbers above drawn directly from the research above.
+        "assumptions": specific numbers above that are your own estimate/rule-of-thumb,
+        not confirmed by the research.
         """)
 
         chain = prompt | self.llm
         response = chain.invoke({
-            "startup_idea": startup_idea
+            "startup_idea": startup_idea,
+            "funnel_research": str(funnel_research[:3]) if funnel_research else "No CAC/conversion data found"
         })
 
         funnel_data = extract_json(
             response.content,
-            fallback_keys=("acquisition_rate", "activation_rate", "revenue_rate", "scenarios", "referral_impact"),
+            fallback_keys=("acquisition_rate", "activation_rate", "revenue_rate", "scenarios", "referral_impact", "sourced_claims", "assumptions"),
         )
 
         logger.info("Acquisition funnel calculated")
@@ -274,6 +317,9 @@ class ViabilityAnalyzer:
         return viability_assessment
 
 
+from src.nodes.desirability_node import _collect_provenance
+
+
 def viability_node(state: StartupStressTestState) -> StartupStressTestState:
     """Comprehensive viability evaluation node."""
     logger.info(f"Starting viability evaluation for: {state['startup_idea']}")
@@ -293,6 +339,14 @@ def viability_node(state: StartupStressTestState) -> StartupStressTestState:
     churn_data = analyzer.research_churn_rate(customer_segment, industry)
     funnel_data = analyzer.calculate_customer_acquisition_funnel(state['startup_idea'], pricing_data, churn_data)
     viability_assessment = analyzer.generate_viability_assessment(market_data, strategy_data, pricing_data, churn_data, funnel_data)
+
+    provenance = []
+    provenance += _collect_provenance("viability", "market_size", market_data)
+    provenance += _collect_provenance("viability", "pricing", pricing_data)
+    provenance += _collect_provenance("viability", "churn", churn_data)
+    provenance += _collect_provenance("viability", "acquisition_funnel", funnel_data)
+    for claim in (viability_assessment.get("assumptions") or []):
+        provenance.append({"stage": "viability", "phase": "scoring", "type": "assumption", "claim": claim})
 
     analysis_report = f"""
     ============================================
@@ -322,6 +376,8 @@ def viability_node(state: StartupStressTestState) -> StartupStressTestState:
     state['viability_analysis'] = analysis_report
     state['viability_status'] = EvaluationStatus.COMPLETED
     state['viability_score'] = viability_assessment.get('overall_score', 0)
+    existing_provenance = [a for a in (state.get('all_assumptions') or []) if a.get('stage') != 'viability']
+    state['all_assumptions'] = existing_provenance + provenance
 
     logger.info(f"Viability evaluation completed. Score: {state['viability_score']}")
     return state
